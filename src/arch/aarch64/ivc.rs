@@ -151,16 +151,20 @@ impl From<&HvIvcConfig> for IvcRecord {
 
 impl Zone {
     pub fn ivc_init(&mut self, ivc_configs: &[HvIvcConfig]) {
+        let mut inner = self.write();
         for ivc_config in ivc_configs {
             // is_new is ok to remove
-            if let Ok((_, start_paddr)) = insert_ivc_record(ivc_config, self.id as _) {
+            if let Ok((_, start_paddr)) = insert_ivc_record(ivc_config, self.id() as _) {
                 info!(
                     "ivc init: zone {}'s shared mem begins at {:x}, ipa is {:x}",
-                    self.id, start_paddr, ivc_config.shared_mem_ipa
+                    self.id(),
+                    start_paddr,
+                    ivc_config.shared_mem_ipa
                 );
                 let rw_sec_size: usize = ivc_config.rw_sec_size as usize;
                 let out_sec_size: usize = ivc_config.out_sec_size as usize;
-                self.gpm
+                inner
+                    .gpm_mut()
                     .insert(MemoryRegion::new_with_offset_mapper(
                         ivc_config.shared_mem_ipa as _,
                         start_paddr,
@@ -174,7 +178,8 @@ impl Zone {
                     } else {
                         MemFlags::READ
                     };
-                    self.gpm
+                    inner
+                        .gpm_mut()
                         .insert(MemoryRegion::new_with_offset_mapper(
                             ivc_config.shared_mem_ipa as usize + rw_sec_size + i * out_sec_size,
                             start_paddr + rw_sec_size + i * out_sec_size,
@@ -183,7 +188,7 @@ impl Zone {
                         ))
                         .unwrap();
                 }
-                self.mmio_region_register(
+                inner.mmio_region_register(
                     ivc_config.control_table_ipa as _,
                     PAGE_SIZE,
                     mmio_ivc_handler,
@@ -193,7 +198,9 @@ impl Zone {
                 return;
             }
         }
-        IVC_INFOS.lock().insert(self.id, IvcInfo::from(ivc_configs));
+        IVC_INFOS
+            .lock()
+            .insert(self.id(), IvcInfo::from(ivc_configs));
     }
 }
 

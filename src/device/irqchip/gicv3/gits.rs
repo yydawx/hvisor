@@ -184,7 +184,7 @@ impl Cmdq {
         self.cbaser_list[zone_id] = value;
         let gpa_base = value & 0xffffffffff000;
         unsafe {
-            let _phy_base = match this_zone().read().gpm.page_table_query(gpa_base) {
+            let _phy_base = match this_zone().read().gpm().page_table_query(gpa_base) {
                 Ok(p) => self.phy_base_list[zone_id] = p.0,
                 _ => {}
             };
@@ -235,8 +235,7 @@ impl Cmdq {
         let code = (value[0] & 0xff) as usize;
         let mut new_cmd = value.clone();
         let binding = this_zone();
-        let zone = binding.read();
-        let cpuset_bitmap = zone.cpu_set.bitmap;
+        let cpuset_bitmap = binding.read().cpu_set().bitmap;
         match code {
             0x0b => {
                 let id = value[0] & 0xffffffff00000000;
@@ -266,7 +265,7 @@ impl Cmdq {
                 let phys_itt_base = unsafe {
                     this_zone()
                         .read()
-                        .gpm
+                        .gpm()
                         .page_table_query(itt_base as _)
                         .unwrap()
                         .0

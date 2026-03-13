@@ -128,8 +128,7 @@ impl Zone {
     }
 
     pub fn arch_zone_pre_configuration(&mut self, config: &HvZoneConfig) -> HvResult {
-        self.ivc_init(config.ivc_config());
-        Ok(())
+        self.ivc_init(config.ivc_config())
     }
 
     pub fn arch_zone_post_configuration(&mut self, _config: &HvZoneConfig) -> HvResult {
@@ -147,7 +146,8 @@ impl Zone {
             let ctr_el0: u64;
             core::arch::asm!("mrs {0}, ctr_el0", out(reg) ctr_el0, options(nostack, preserves_flags));
             let dcache_line_size = (1 << ((ctr_el0 >> 16 & 0xF) as usize)) * 4;
-            self.gpm.for_each_region(|region| {
+            let inner = self.read();
+            inner.gpm().for_each_region(|region| {
                 // Invalidate all RAM regions of the guest
                 if !region.flags.contains(MemFlags::IO) { // TODO: need to enrich the types and exercise more precise control
                     // Calculate the physical start address of the region

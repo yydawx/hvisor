@@ -6,12 +6,13 @@ set -x            # Print commands for debugging
 # Environment Configuration
 # ========================
 WORKSPACE_ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
-ROOTFS_DIR="${WORKSPACE_ROOT}/platform/riscv64/qemu-plic/image/virtdisk/rootfs"
-LINUX_KERNEL_DIR="${WORKSPACE_ROOT}/platform/riscv64/qemu-plic/image/virtdisk/linux_v6.10-rc1"
-HVISOR_TOOL_DIR="${WORKSPACE_ROOT}/platform/riscv64/qemu-plic/image/virtdisk/hvisor-tool"
-CONFIG_DIR="${WORKSPACE_ROOT}/platform/riscv64/qemu-plic/configs"
-TEST_DIR="${WORKSPACE_ROOT}/platform/riscv64/qemu-plic/test/systemtest"
-DTS_DIR="${WORKSPACE_ROOT}/platform/riscv64/qemu-plic/image/dts"
+ROOTFS_DIR="${WORKSPACE_ROOT}/platform/x86_64/qemu/image/virtdisk/rootfs"
+LINUX_SRC_DIR="${WORKSPACE_ROOT}/platform/x86_64/qemu/image/virtdisk/linux"
+HVISOR_TOOL_DIR="${WORKSPACE_ROOT}/platform/x86_64/qemu/image/virtdisk/hvisor-tool"
+CONFIG_DIR="${WORKSPACE_ROOT}/platform/x86_64/qemu/configs"
+TEST_DIR="${WORKSPACE_ROOT}/platform/x86_64/qemu/test/systemtest"
+LINUX_KERNEL_IMAGE_DIR="${WORKSPACE_ROOT}/platform/x86_64/qemu/image/kernel"
+BOOT_BIN_DIR="${WORKSPACE_ROOT}/platform/x86_64/qemu/image/bootloader/out"
 
 # ========================
 # Function Definitions
@@ -20,7 +21,7 @@ DTS_DIR="${WORKSPACE_ROOT}/platform/riscv64/qemu-plic/image/dts"
 mount_rootfs() {
     echo "=== Mounting root filesystem ==="
     sudo mkdir -p "${ROOTFS_DIR}"
-    if ! sudo mount rootfs1.ext4 "${ROOTFS_DIR}"; then
+    if ! sudo mount rootfs1.img "${ROOTFS_DIR}"; then
         echo "ERROR: Failed to mount rootfs" >&2
         exit 1
     fi
@@ -28,8 +29,18 @@ mount_rootfs() {
 
 prepare_sources() {
     echo "=== Cloning required repositories ==="
-    git clone https://github.com/CHonghaohao/linux_v6.10-rc1.git || return 1
+    git clone https://github.com/torvalds/linux -b v5.19 --depth=1 || return 1
+    cd linux
+    git checkout v5.19
+    sudo cp -v "${CONFIG_DIR}/linux_config" ./.config
+    make ARCH=x86_64 olddefconfig
+    make modules_prepare
+    cd ..
     git clone https://github.com/syswonder/hvisor-tool.git || return 1
+    cd hvisor-tool
+    # TODO: no checkout
+    git checkout dev-x86_64
+    cd ..
 }
 
 build_hvisor_tool() {
@@ -38,33 +49,35 @@ build_hvisor_tool() {
 
     # Cross-compilation parameters
     make all \
-        ARCH=riscv \
+        ARCH=x86_64 \
         LOG=LOG_INFO \
-        KDIR="${LINUX_KERNEL_DIR}"
+        KDIR="${LINUX_SRC_DIR}"
 }
 
 deploy_artifacts() {
     echo "=== Deploying build artifacts ==="
-    local dest_dir="${ROOTFS_DIR}/home/riscv64"
+    local dest_dir="${ROOTFS_DIR}"
     local test_dest="${dest_dir}/test"
     # Copy main components
     sudo cp -v "${HVISOR_TOOL_DIR}/tools/hvisor" "${dest_dir}/"
     sudo cp -v "${HVISOR_TOOL_DIR}/driver/hvisor.ko" "${dest_dir}/"
-    # Device Tree & Configurations
-    sudo cp -v "${DTS_DIR}/zone1-linux.dtb" "${dest_dir}/zone1-linux.dtb"
-    sudo cp -v "${CONFIG_DIR}/virtio-backend.json" "${dest_dir}/virtio-backend.json"
-    sudo cp -v "${CONFIG_DIR}/zone1-linux-virtio.json" "${dest_dir}/zone1-linux-virtio.json"
-    # Test artifacts
+    # Copy configurations
+    sudo cp -v "${CONFIG_DIR}/zone1_linux.json" "${dest_dir}/zone1_linux.json"
+    sudo cp -v "${CONFIG_DIR}/virtio_cfg.json" "${dest_dir}/virtio_cfg.json"
+    # Copy test artifacts
+    mkdir -p "${test_dest}"
+    mkdir -p "${test_dest}/testcase"
+    mkdir -p "${test_dest}/testresult"
     sudo cp -v ${TEST_DIR}/testcase/* "${test_dest}/testcase/"
     sudo cp -v "${TEST_DIR}/textract_dmesg.sh" "${test_dest}/"
     sudo cp -v "${TEST_DIR}/tresult.sh" "${test_dest}/"
-    # Boot zone1 shells
-    sudo cp -v "${TEST_DIR}/boot_zone1.sh" "${dest_dir}/"
-    sudo cp -v "${TEST_DIR}/screen_zone1.sh" "${dest_dir}/"
-
+    # Copy kernel images
+    sudo cp -v "${LINUX_KERNEL_IMAGE_DIR}/setup.bin" "${dest_dir}/"
+    sudo cp -v "${LINUX_KERNEL_IMAGE_DIR}/vmlinux.bin" "${dest_dir}/"
+    # sudo cp -v "${BOOT_BIN_DIR}/boot.bin" "${dest_dir}/"
     # Verify deployment
-    echo "=== Deployed files list ==="
-    sudo find "${dest_dir}" -ls
+    # echo "=== Deployed files list ==="
+    # sudo find "${dest_dir}" -ls
 
 }
 
@@ -79,11 +92,11 @@ umount_rootfs() {
 # Main Execution Flow
 # ========================
 (
-    cd "${WORKSPACE_ROOT}/platform/riscv64/qemu-plic/image/virtdisk"
+    cd "${WORKSPACE_ROOT}/platform/x86_64/qemu/image/virtdisk"
     
     # Setup environment
-    mount_rootfs
     prepare_sources
+    mount_rootfs
     trap umount_rootfs EXIT TERM
     
     # Build process

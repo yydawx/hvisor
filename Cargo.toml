@@ -73,7 +73,7 @@ uart_16550 = []
 sifive_ccache = []
 eic7700_sysreg = []
 uart16550a = []
-
+sequential_output = []
 ############## riscv64 #############
 # irqchip driver
 plic = []

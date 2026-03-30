@@ -1,4 +1,5 @@
 gicv2
 pl011
-iommu
 pci
+ecam_pcie
+aarch64_uefi_support

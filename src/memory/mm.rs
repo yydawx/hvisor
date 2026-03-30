@@ -137,6 +137,7 @@ where
             );
             return hv_result_err!(EINVAL);
         }
+        // Keep metadata and page table consistent: pt.map must be all-or-nothing.
         self.pt.map(&region)?;
         self.regions.insert(region.start, region);
         Ok(())

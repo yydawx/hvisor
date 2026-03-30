@@ -150,7 +150,7 @@ impl From<&HvIvcConfig> for IvcRecord {
 }
 
 impl Zone {
-    pub fn ivc_init(&mut self, ivc_configs: &[HvIvcConfig]) {
+    pub fn ivc_init(&mut self, ivc_configs: &[HvIvcConfig]) -> HvResult {
         let mut inner = self.write();
         for ivc_config in ivc_configs {
             // is_new is ok to remove
@@ -170,8 +170,7 @@ impl Zone {
                         start_paddr,
                         rw_sec_size as _,
                         MemFlags::READ | MemFlags::WRITE,
-                    ))
-                    .unwrap();
+                    ))?;
                 for i in 0..ivc_config.max_peers as usize {
                     let flags = if i == ivc_config.peer_id as _ {
                         MemFlags::READ | MemFlags::WRITE
@@ -185,8 +184,7 @@ impl Zone {
                             start_paddr + rw_sec_size + i * out_sec_size,
                             out_sec_size as _,
                             flags,
-                        ))
-                        .unwrap();
+                        ))?;
                 }
                 inner.mmio_region_register(
                     ivc_config.control_table_ipa as _,
@@ -195,12 +193,15 @@ impl Zone {
                     ivc_config.control_table_ipa as _,
                 );
             } else {
-                return;
+                return hv_result_err!(EINVAL);
             }
         }
+
         IVC_INFOS
             .lock()
             .insert(self.id(), IvcInfo::from(ivc_configs));
+
+        Ok(())
     }
 }
 

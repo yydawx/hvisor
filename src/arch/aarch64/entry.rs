@@ -125,7 +125,8 @@ pub unsafe extern "C" fn boot_cpuid_get() {
         mrs x19, mpidr_el1
         ldr x2, ={mpidr_mask}
         and x19, x19, x2
-        adr x2, {mpidr_mappings}
+        adrp x2, {mpidr_mappings}
+        add x2, x2, :lo12:{mpidr_mappings}
         mov x4, #0
     1:
         // search for the mpidr_el1 mapping in BOARD_MPIDR_MAPPINGS.

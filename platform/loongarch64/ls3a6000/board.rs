@@ -17,7 +17,7 @@
 use crate::pci_dev;
 use crate::{arch::zone::HvArchZoneConfig, config::*, pci::vpci_dev::VpciDevType};
 
-pub const BOARD_NAME: &str = "ls3a5000";
+pub const BOARD_NAME: &str = "ls3a6000";
 
 pub const BOARD_NCPUS: usize = 4;
 

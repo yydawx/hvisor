@@ -3,6 +3,9 @@
 /test-img
 /hvisor.S
 /hvisor-elf.txt
+/hvisor.elf
+/hvisor-trap-vector.h
+/Doc/compile.md
 /images/*
 /platform/*/*/image/kernel/*
 /platform/*/*/image/virtdisk/*

@@ -66,6 +66,7 @@ mod pci;
 #[cfg(test)]
 mod tests;
 
+use crate::arch::entry::arch_secondary_entry;
 use crate::arch::iommu::iommu_init;
 use crate::arch::mm::{arch_post_heap_init, arch_setup_parange};
 use crate::consts::{hv_end, mem_pool_start, MAX_CPU_NUM};
@@ -175,7 +176,13 @@ fn wakeup_secondary_cpus(this_id: usize, host_dtb: usize) {
         if cpu_id == this_id {
             continue;
         }
+        
+        #[cfg(not(target_arch = "loongarch64"))]
         cpu_start(cpu_id, arch_entry as _, host_dtb);
+
+        #[cfg(target_arch = "loongarch64")]
+        cpu_start(cpu_id, arch_secondary_entry as _, host_dtb);
+        // restore the boot context, specially for la64
     }
 }
 
@@ -196,6 +203,11 @@ fn rust_main(cpuid: usize, host_dtb: usize) {
     if MASTER_CPU.load(Ordering::Acquire) == -1 {
         MASTER_CPU.store(cpuid as i32, Ordering::Release);
         is_primary = true;
+        
+        #[cfg(target_arch = "loongarch64")]
+        {
+            clear_bss();
+        }
         percpu::init();
         memory::heap::init();
         memory::heap::test();

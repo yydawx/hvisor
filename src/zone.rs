@@ -125,6 +125,8 @@ pub struct ZoneInner {
     vpci_bus: VirtualRootComplex,
     #[cfg(feature = "dwc_pcie")]
     atu_configs: VirtualAtuConfigs,
+    #[cfg(target_arch = "loongarch64")]
+    pub efi_system_table: usize,
 }
 
 impl Zone {
@@ -183,6 +185,8 @@ impl ZoneInner {
             vpci_bus: VirtualRootComplex::new(),
             #[cfg(feature = "dwc_pcie")]
             atu_configs: VirtualAtuConfigs::new(),
+            #[cfg(target_arch = "loongarch64")]
+            efi_system_table: 0,
         }
     }
 

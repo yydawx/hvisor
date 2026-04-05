@@ -13,20 +13,53 @@
 //
 // Authors:
 //      Yulong Han <wheatfox17@icloud.com>
+//      Ming Shen  <boneinscri@163.com>
 //
 
 use super::register::*;
 use super::zone::ZoneContext;
 use crate::arch::cpu::this_cpu_id;
 use crate::arch::ipi::*;
+use crate::arch::eiointc::{
+    loongarch_eiointc_readl, loongarch_eiointc_writel,
+    do_real_read_iocsr, do_real_write_iocsr,
+    EIOINTC_BASE, EIOINTC_SIZE, EIOINTC_VIRT_BASE, EIOINTC_VIRT_SIZE,
+};
+use crate::arch::timer::{restore_timer, save_timer, timer_init};
 use crate::consts::{IPI_EVENT_CLEAR_INJECT_IRQ, MAX_CPU_NUM};
-use crate::cpu_data::this_cpu_data;
-use crate::device::irqchip::inject_irq;
+use crate::cpu_data::{get_cpu_data, this_cpu_data};
+use crate::device::irqchip::{inject_irq, ls7a2000::clear_irq};
 use crate::device::irqchip::ls7a2000::chip::*;
 use crate::event::{check_events, dump_cpu_events, dump_events};
 use crate::hypercall::{SGI_IPI_ID, *};
 use crate::memory::{addr, mmio_handle_access, MMIOAccess};
 use crate::zone::Zone;
+
+// IOCSR address range classification
+const IOCSR_TYPE_IPI: usize = 0;
+const IOCSR_TYPE_EIOINTC: usize = 1;
+const IOCSR_TYPE_EIOINTC_VIRT: usize = 2;
+const IOCSR_TYPE_OTHER: usize = 3;
+
+fn get_iocsr_type(addr: usize) -> usize {
+    if addr >= IOCSR_IPI_BASE && addr < IOCSR_IPI_BASE + 0x200 {
+        IOCSR_TYPE_IPI
+    } else if addr >= EIOINTC_BASE && addr < EIOINTC_BASE + EIOINTC_SIZE {
+        IOCSR_TYPE_EIOINTC
+    } else if addr >= EIOINTC_VIRT_BASE && addr < EIOINTC_VIRT_BASE + EIOINTC_VIRT_SIZE {
+        IOCSR_TYPE_EIOINTC_VIRT
+    } else {
+        IOCSR_TYPE_OTHER
+    }
+}
+
+// 0 or 7
+// boneinscri : 2026.04
+// VS_VALUE = 0, one handler
+// VS_VALUE = 7, interrupt vector
+// it can be changed runtime
+pub const GLOBAL_VS_VALUE: usize = 0;
+
 use crate::PHY_TO_DMW_UNCACHED;
 use core::arch;
 use core::arch::asm;
@@ -84,24 +117,23 @@ pub static GLOBAL_TRAP_CONTEXT_HELPER_PER_CPU: [Mutex<TrapContextHelper>; MAX_CP
 
 pub fn install_trap_vector() {
     // force disable INT here
-    crmd::set_ie(false);
     // clear UEFI firmware's previous timer configs
     ticlr::clear_timer_interrupt();
+    disable_global_interrupt();
+    ecfg_ipi_disable();
 
     timer_init();
     tcfg::set_en(false); // we may need to use timer irq to trap for our virtio clear injection
                          // only enable timer irq trap for debugging, because it may cause overheads for realtime nonroots
 
-    // set CSR.EENTRY to _hyp_trap_vector and int vector offset to 0
-    ecfg::set_vs(0);
+    // set CSR.EENTRY to _hyp_trap_vector and int vector offset to 0/?
+    ecfg::set_vs(GLOBAL_VS_VALUE);
     eentry::set_eentry(_hyp_trap_vector as usize);
 
     // enable floating point
     euen::set_fpe(true); // basic floating point
     euen::set_sxe(true); // 128-bit SIMD
     euen::set_asxe(true); // 256-bit SIMD
-
-    enable_global_interrupt()
 }
 
 /// enable CRMD.IE
@@ -140,24 +172,59 @@ pub fn ktime_get() -> usize {
     current_counter_time
 }
 
-pub fn timer_init() {
-    // uefi firmware leaves timer interrupt pending, we need to clear it manually
-    ticlr::clear_timer_interrupt();
-    let timer_freq = time::get_timer_freq();
-    tcfg::set_periodic(true);
-    let init_val = get_ms_counter(200);
-    tcfg::set_init_val(init_val);
+pub fn ipi_init() {
+    let mut lie_ = ecfg::read().lie();
+    lie_ = lie_ | LineBasedInterrupt::IPI;
+    ecfg::set_lie(lie_);
+}
 
-    tcfg::set_en(true);
+pub fn ecfg_timer_disable() {
+    let mut lie_ = ecfg::read().lie();
+    lie_ = lie_ & !LineBasedInterrupt::TIMER;
+    ecfg::set_lie(lie_);
+}
 
+pub fn ecfg_timer_enable() {
     let mut lie_ = ecfg::read().lie();
     lie_ = lie_ | LineBasedInterrupt::TIMER;
     ecfg::set_lie(lie_);
 }
 
-pub fn ipi_init() {
+pub fn ecfg_swi_enable() {
     let mut lie_ = ecfg::read().lie();
-    lie_ = lie_ | LineBasedInterrupt::IPI;
+    lie_ = lie_ | LineBasedInterrupt::SWI0 | LineBasedInterrupt::SWI1;
+    ecfg::set_lie(lie_);
+}
+
+pub fn ecfg_swi_disable() {
+    let mut lie_ = ecfg::read().lie();
+    lie_ = lie_ & !LineBasedInterrupt::SWI0 & !LineBasedInterrupt::SWI1;
+    ecfg::set_lie(lie_);
+}
+
+pub fn ecfg_hwi_disable() {
+    let mut lie_ = ecfg::read().lie();
+    lie_ = lie_ & !LineBasedInterrupt::HWI0;
+    lie_ = lie_ & !LineBasedInterrupt::HWI1;
+    lie_ = lie_ & !LineBasedInterrupt::HWI2;
+    lie_ = lie_ & !LineBasedInterrupt::HWI3;
+    lie_ = lie_ & !LineBasedInterrupt::HWI4;
+    lie_ = lie_ & !LineBasedInterrupt::HWI5;
+    lie_ = lie_ & !LineBasedInterrupt::HWI6;
+    lie_ = lie_ & !LineBasedInterrupt::HWI7;
+    ecfg::set_lie(lie_);
+}
+
+pub fn ecfg_hwi_enable() {
+    let mut lie_ = ecfg::read().lie();
+    lie_ = lie_ | LineBasedInterrupt::HWI0;
+    lie_ = lie_ | LineBasedInterrupt::HWI1;
+    lie_ = lie_ | LineBasedInterrupt::HWI2;
+    lie_ = lie_ | LineBasedInterrupt::HWI3;
+    lie_ = lie_ | LineBasedInterrupt::HWI4;
+    lie_ = lie_ | LineBasedInterrupt::HWI5;
+    lie_ = lie_ | LineBasedInterrupt::HWI6;
+    lie_ = lie_ | LineBasedInterrupt::HWI7;
     ecfg::set_lie(lie_);
 }
 
@@ -223,15 +290,9 @@ pub fn trap_handler(mut ctx: &mut ZoneContext) {
     trace!("loongarch64: trap_handler: ctx addr = {:p}", &ctx);
 
     // save timer
-    let delta;
-    let ticks = ctx.gcsr_tval;
-    let cfg = ctx.gcsr_tcfg;
-    if ticks < cfg {
-        delta = ticks;
-    } else {
-        delta = 0;
-    }
-    let expire = ktime_get() + delta;
+    // --boneinscri 2026.04
+    let pcpu_id = this_cpu_id();
+    save_timer(ctx, pcpu_id);
 
     // dump trap csr regs
     let estat_ = estat::read();
@@ -291,46 +352,10 @@ pub fn trap_handler(mut ctx: &mut ZoneContext) {
         ctx,
     );
 
-    // restore timer
-    let cfg = ctx.gcsr_tcfg;
-
-    ctx.gcsr_tcfg = 0;
-
-    // restore GCSR_ESTAT and GCSR_TCFG
-    ctx.gcsr_estat = 0;
-    ctx.gcsr_tcfg = 0;
-
-    debug!("loongarch64: trap_handler: restore timer, cfg={:#x}", cfg);
-
-    if cfg & 1 == 0 {
-        // guest has disabled timer, we just restore the tval
-        ctx.gcsr_tval = 0;
-    } else {
-        let ticks = ctx.gcsr_tval;
-        let estat = ctx.gcsr_estat;
-
-        if !((cfg & 2) != 0 && (ticks > cfg)) {
-            ctx.gcsr_tval = 0; // inject irq
-            let cpu_timer = 1usize << 11;
-            if estat & cpu_timer == 0 {
-                ctx.gcsr_ticlr = 1; // clear timer interrupt
-            }
-        } else {
-            let now = ktime_get();
-            let mut __delta = 0;
-            if now < expire {
-                __delta = expire - now;
-            } else if (cfg & 2) != 0 {
-                // tcfg[63:2] || 00 is tval
-                let period = cfg & (0xffff_ffff_ffff_fffc);
-                __delta = now - expire;
-                __delta = period - (__delta % period);
-                // kvm queued guest timer irq injection here but we do nothing here
-            }
-
-            ctx.gcsr_tval = __delta;
-        }
-    }
+    // restore timer + inject irq
+    // --boneinscri 2026.04
+    restore_timer(ctx, pcpu_id);
+    deliver_irq();
 
     debug!("loongarch64: trap_handler: return");
 
@@ -645,6 +670,15 @@ pub fn _vcpu_return(ctx: usize) {
 
     // Enable interrupt
     prmd::set_pie(true);
+
+    // ecfg_timer_enable();
+
+    // ecfg_hwi_enable();
+    // ecfg_swi_enable();
+
+    ecfg::set_vs(GLOBAL_VS_VALUE);
+    eentry::set_eentry(_hyp_trap_vector as usize);
+
     trace!(
         "loongarch64: _vcpu_return: calling _hyp_trap_return with ctx = {:#x}",
         ctx
@@ -1263,33 +1297,93 @@ const HWI4: usize = 1 << 6;
 const HWI5: usize = 1 << 7;
 const HWI6: usize = 1 << 8;
 const HWI7: usize = 1 << 9;
+const SWI0: usize = 1 << 0;
+const SWI1: usize = 1 << 1;
+
+
+fn do_deliver_irq(irq_flags: usize, clear_flag: bool) {
+    for irq in (0..13).rev() {
+        let mask = 1 << irq;
+        if irq_flags & mask != 0 {
+            if clear_flag {
+                // clear irq
+                clear_irq(irq, false);// para is_hardware is invalid here
+            } else {
+                // inject irq
+                inject_irq(irq, false);
+            }
+        }
+    }
+}
+
+fn deliver_irq() {
+    let pcpu_id = this_cpu_id();
+    let pcpu_data = get_cpu_data(pcpu_id);
+    let irq_pending = pcpu_data.arch_cpu.irq_pending;
+    let irq_clear = pcpu_data.arch_cpu.irq_clear;
+    if irq_pending == 0 && irq_clear == 0 {
+        return;
+    }
+    assert!(irq_clear & irq_pending == 0);
+
+    do_deliver_irq(irq_clear, true);
+    do_deliver_irq(irq_pending, false);
+    pcpu_data.arch_cpu.irq_pending = 0;
+    pcpu_data.arch_cpu.irq_clear = 0;
+}
 
 /// handle loongarch64 interrupts here
 fn handle_interrupt(is: usize) {
     // Handle IPI interrupts
-    if is & IPI_BIT != 0 {
-        let cpu_id = this_cpu_id();
-        let ipi_status = get_ipi_status(cpu_id);
-        debug!(
-            "CPU {} received IPI interrupt, status = {:#x}",
-            cpu_id, ipi_status
-        );
+    let pcpu_id_this: usize = this_cpu_id();
+    let pcpu_data = get_cpu_data(pcpu_id_this);
 
-        match ipi_status {
-            status if status == SGI_IPI_ID as _ => {
-                let events = dump_cpu_events(cpu_id);
-                debug!("CPU {} events: {:?}", cpu_id, events);
-                while check_events() {}
+    if is & IPI_BIT != 0 {
+        let ipi_status = get_ipi_status(pcpu_id_this);
+
+        let mut ipistate = pcpu_data.arch_cpu.ipi_state.lock();
+        let pcpu_ipi_status = ipistate.status as usize; // read
+
+        reset_ipi(pcpu_id_this); // clear
+
+        if pcpu_ipi_status & SMP_BOOT_CPU != 0 {
+            if pcpu_data.arch_cpu.power_on == true {
+                panic!("pcpu : {} has already power on, this should not happen", pcpu_id_this);
             }
-            status if status == 0x8 => {
-                debug!("CPU {} received unhandled IPI status {:#x}", cpu_id, status);
-            }
-            status => {
-                warn!("CPU {} received unknown IPI status {:#x}", cpu_id, status);
+            // this should be done by firmware, but we do this here, because linux kernel does not do it
+            ipistate.status &= !(ipi_status as u32);
+
+            let first_pcpu_id = pcpu_data.zone.as_ref().unwrap().read().cpu_set().first_cpu().unwrap();
+            
+            if(first_pcpu_id == pcpu_id_this) {
+                // this is the first cpu in the zone
+                drop(ipistate);// remember! avoid deadlock
+                pcpu_data.arch_cpu.run();
+                panic!("can't reach here");
+            } else {
+                // this is not the first cpu in the zone, read smpboot_entry from ipistate.buf
+                let smpboot_entry = ipistate.buf[first_pcpu_id] as usize;
+                warn!("pcpu_ipi_status = {:#x}, first_pcpu_id = {:#x}, smpboot_entry: {:#x}, pcpu_ipi_status = {:#x}", 
+                pcpu_ipi_status, first_pcpu_id, smpboot_entry, ipistate.status as usize);
+                drop(ipistate);// remember! avoid deadlock
+                pcpu_data.arch_cpu.run_secondary(smpboot_entry);
+                panic!("can't reach here");    
             }
         }
-        reset_ipi(cpu_id);
-        return;
+        else if pcpu_ipi_status & HVISOR_SHUTDOWN != 0 {
+            if pcpu_data.arch_cpu.power_on == false {
+                panic!("pcpu : {} has not power on, this should not happen", pcpu_id_this);
+            }
+            ipistate.status &= !(ipi_status as u32);
+            drop(ipistate);
+            pcpu_data.arch_cpu.idle();
+        }
+        else if pcpu_ipi_status != 0 {
+            drop(ipistate);
+            pcpu_data.arch_cpu.add_irq(INT_IPI);
+        } else {
+        }
+        return ;
     }
 
     // Handle timer interrupts
@@ -1311,6 +1405,13 @@ fn handle_interrupt(is: usize) {
         );
         return;
     }
+
+    if is & SWI0 != 0 {
+        panic!("swi0 not handled");
+    }
+    if is & SWI1 != 0 {
+        panic!("swi1 not handled");
+    }    
 
     // Handle unknown interrupts
     error!("Received unhandled interrupt, status = {:#x}", is);
@@ -1364,9 +1465,12 @@ fn emulate_cpucfg(ins: usize, ctx: &mut ZoneContext) {
         // according to manual, we should set result to 0 if index is invalid
     } else {
         // just run cpucfg here
-        let result: usize;
+        let mut result= 0;
         unsafe {
             asm!("cpucfg {}, {}", out(reg) result, in(reg) cpucfg_target_idx);
+        }
+        if cpucfg_target_idx == 0x2 {
+            result &= !(1 << 10); // shutdown lvz of vm -- boneinscri 2026.04        
         }
         ctx.x[rd] = result;
         // finish the emulation by tweaking the ZoneContext's registers
@@ -1433,6 +1537,54 @@ fn ty2str(ty: usize) -> &'static str {
     }
 }
 
+
+// boneinscri 2026.04
+pub fn loongarch_iocsr_read(pcpu_id: usize, addr: usize, len: usize) -> usize {
+    let iocsr_type = get_iocsr_type(addr);
+    match iocsr_type {
+        IOCSR_TYPE_IPI => {   
+            // IPI         
+            let ret = loongarch_ipi_readl(pcpu_id, addr, len);
+            ret
+        },
+        IOCSR_TYPE_EIOINTC => {
+            // EIOINTC
+            let ret = loongarch_eiointc_readl(pcpu_id, addr, len);
+            ret
+        },
+        IOCSR_TYPE_EIOINTC_VIRT => {
+            panic!("EIOINTC_VIRT detected, this is not supported yet");
+        },
+        _ => {
+            let mut addr_real = addr;
+            do_real_read_iocsr(addr_real, len)
+        }
+    }
+}
+pub fn loongarch_iocsr_write(pcpu_id: usize, addr: usize, val: usize, len: usize) -> usize {
+    let iocsr_type = get_iocsr_type(addr);
+    match iocsr_type {
+        IOCSR_TYPE_IPI => {
+            // IPI
+            let ret = loongarch_ipi_writel(pcpu_id, addr, val, len);
+            ret
+        },
+        IOCSR_TYPE_EIOINTC => {
+            // EIOINTC
+            let ret = loongarch_eiointc_writel(pcpu_id, addr, val, len);
+            ret 
+        },
+        IOCSR_TYPE_EIOINTC_VIRT => {
+            panic!("EIOINTC_VIRT detected, this is not supported yet");
+        },
+        _ => {
+            let mut addr_real = addr;
+            do_real_write_iocsr(addr_real, val, len);
+            0
+        }
+    }
+}
+
 fn emulate_iocsr(ins: usize, ctx: &mut ZoneContext) {
     // iocsrrd.b rd, rj     0000011001 001000000000 rj[9:5] rd[4:0]
     // iocsrrd.h rd, rj     0000011001 001000000001 rj[9:5] rd[4:0]
@@ -1448,96 +1600,28 @@ fn emulate_iocsr(ins: usize, ctx: &mut ZoneContext) {
     debug!("iocsr emulation, ty = {}, rd = {}, rj = {}", ty, rd, rj);
     debug!("GPR[rd] = {:#x}, GPR[rj] = {:#x}", ctx.x[rd], ctx.x[rj]);
 
-    const IOCSR_BASE_ADDR_PHY: usize = 0x1fe0_0000;
-    let mut mmio_access = MMIOAccess {
-        address: IOCSR_BASE_ADDR_PHY + ctx.x[rj], // iocsr only issues an offset from IOCSR_BASE_ADDR_PHY, so we need the calculate the real phy addr
-        size: 0,
-        is_write: false,
-        value: ctx.x[rd],
-    };
+    let mut len = 0;
+    let mut is_write = false;
+    let addr = ctx.x[rj] as usize; 
+    let val = ctx.x[rd] as usize;
 
-    match ty {
-        0 => {
-            // iocsrrd.b
-            mmio_access.size = 1;
-            mmio_access.is_write = false;
-        }
-        1 => {
-            // iocsrrd.h
-            mmio_access.size = 2;
-            mmio_access.is_write = false;
-        }
-        2 => {
-            // iocsrrd.w
-            mmio_access.size = 4;
-            mmio_access.is_write = false;
-        }
-        3 => {
-            // iocsrrd.d
-            mmio_access.size = 8;
-            mmio_access.is_write = false;
-        }
-        4 => {
-            // iocsrwr.b
-            mmio_access.size = 1;
-            mmio_access.is_write = true;
-        }
-        5 => {
-            // iocsrwr.h
-            mmio_access.size = 2;
-            mmio_access.is_write = true;
-        }
-        6 => {
-            // iocsrwr.w
-            mmio_access.size = 4;
-            mmio_access.is_write = true;
-        }
-        7 => {
-            // iocsrwr.d
-            mmio_access.size = 8;
-            mmio_access.is_write = true;
-        }
-        _ => {
-            // should not reach here
-            panic!("invalid iocsr type, this is impossible");
-        }
+    if ty < 8 {
+        len = 1 << (ty % 4); // 0-3:1,2,4,8; 4-7:1,2,4,8
+        is_write = ty >= 4;
+    } else {
+        panic!("emulate_iocsr, invalid iocsr type, this is impossible");
     }
 
-    debug!(
-        "iocsr issues a mmio access: {}, target address: {:#x}, size: {}, {}",
-        ty2str(ty),
-        mmio_access.address,
-        mmio_access.size,
-        if mmio_access.is_write { "W" } else { "R" }
-    );
-
-    let res = mmio_handle_access(&mut mmio_access);
-    match res {
-        Ok(_) => {
-            debug!("handle mmio success, v={:#x}", mmio_access.value);
-            if !mmio_access.is_write {
-                let mask = match mmio_access.size {
-                    1 => 0xff,
-                    2 => 0xffff,
-                    4 => 0xffffffff,
-                    8 => 0xffffffffffffffff,
-                    _ => panic!("invalid mmio access size: {}", mmio_access.size),
-                };
-                let trimmed_by_size = mmio_access.value & mask;
-                let extended = if ty < 4 {
-                    signed_ext(trimmed_by_size, mmio_access.size * 8)
-                } else {
-                    trimmed_by_size
-                };
-                ctx.x[rd] = extended;
-            }
-        }
-        Err(e) => {
-            panic!(
-                "mmio access failed, error = {:?}, this is a real page fault",
-                e
-            );
-        }
+    // TODO : modify to vCPU
+    let pcpu_id_this = this_cpu_id();
+        
+    if is_write {
+        let ret = loongarch_iocsr_write(pcpu_id_this, addr, val, len);
+        return;
+    } else {
+        let ret = loongarch_iocsr_read(pcpu_id_this, addr, len);
+        ctx.x[rd] = ret;
+        return;
     }
 }
 

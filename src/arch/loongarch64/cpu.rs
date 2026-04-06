@@ -304,7 +304,8 @@ pub struct ArchCpu {
     pub irq_clear: usize,
     pub ipi_state: Mutex<IpiState>,
     pub eiointc: Mutex<Eiointc>, 
-    pub expire: isize
+    pub expire: isize,
+    pub csr: [usize; 0x513],
 }
 
 impl ArchCpu {
@@ -320,6 +321,7 @@ impl ArchCpu {
             ipi_state: Mutex::new(LoongArch64IpiState::new()),
             eiointc: Mutex::new(LoongArch64Eiointc::new()),
             expire: 0,
+            csr: [0; 0x513],
         };
         return ret;
     }
@@ -432,7 +434,6 @@ impl ArchCpu {
         self.ctx.x[20] = boot_ctx.t8;
 
         snap.write_all();
-        info!("loongarch64: @{:#x?}", self);
         self.vcpu_enter();
     }
 

@@ -35,7 +35,7 @@ pub const HV_HEAP_SIZE: usize = 1 * 1024 * 1024; // 1 MiB
 
 /// Size of the hypervisor memory pool used for dynamic allocation.
 #[cfg(target_arch = "loongarch64")]
-pub const HV_MEM_POOL_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
+pub const HV_MEM_POOL_SIZE: usize = 512 * 1024 * 1024; // 256 MiB
 #[cfg(not(target_arch = "loongarch64"))]
 pub const HV_MEM_POOL_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 
@@ -43,6 +43,10 @@ pub const HV_MEM_POOL_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 ///
 /// This area is allocated for each CPU core and may increase in size during
 /// development.
+
+#[cfg(target_arch = "loongarch64")]
+pub const PER_CPU_SIZE: usize = 1024 * 1024 * 16; // 16MiB
+#[cfg(not(target_arch = "loongarch64"))]
 pub const PER_CPU_SIZE: usize = 512 * 1024; // 512 KiB
 
 /// Pointer to the beginning of the per-CPU data array.

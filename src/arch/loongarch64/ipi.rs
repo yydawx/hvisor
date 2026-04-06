@@ -347,22 +347,22 @@ pub fn ecfg_ipi_enable() {
     let mut lie_ = ecfg::read().lie();
     lie_ = lie_ | LineBasedInterrupt::IPI;
     ecfg::set_lie(lie_);
-    info!(
-        "ecfg ipi enabled on cpu {}, current lie: {:?}",
-        this_cpu_id(),
-        lie_
-    );
+    // info!(
+    //     "ecfg ipi enabled on cpu {}, current lie: {:?}",
+    //     this_cpu_id(),
+    //     lie_
+    // );
 }
 
 pub fn ecfg_ipi_disable() {
     let mut lie_ = ecfg::read().lie();
     lie_ = lie_ & !LineBasedInterrupt::IPI;
     ecfg::set_lie(lie_);
-    info!(
-        "ecfg ipi disabled on cpu {}, current lie: {:?}",
-        this_cpu_id(),
-        lie_
-    );
+    // info!(
+    //     "ecfg ipi disabled on cpu {}, current lie: {:?}",
+    //     this_cpu_id(),
+    //     lie_
+    // );
 }
 
 pub fn dump_ipi_registers() {

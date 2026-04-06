@@ -83,6 +83,18 @@ static INIT_EARLY_OK: AtomicU32 = AtomicU32::new(0);
 static INIT_LATE_OK: AtomicU32 = AtomicU32::new(0);
 static MASTER_CPU: AtomicI32 = AtomicI32::new(-1);
 
+#[cfg(target_arch = "loongarch64")]
+fn print_logo() {
+    println!(r"
+  _            _                   _
+ | |          (_)                 | |
+ | |__  __   ___ ___  ___  _ __   | | __ _
+ | '_ \ \ \ / / / __|/ _ \| '__|  | |/ _` |
+ | | | | \ V /| \__ \ (_) | |    _| | (_| |
+ |_| |_|  \_/ |_|___/\___/|_|   (_)_|\__,_|
+");
+}
+
 pub fn clear_bss() {
     extern "C" {
         fn sbss();
@@ -199,6 +211,8 @@ fn rust_main(cpuid: usize, host_dtb: usize) {
     extern "C" {
         fn skernel();
     }
+    
+    #[cfg(not(target_arch = "loongarch64"))]
     println!("Hello, start HVISOR at {:#x?}!", skernel as usize);
     if MASTER_CPU.load(Ordering::Acquire) == -1 {
         MASTER_CPU.store(cpuid as i32, Ordering::Release);
@@ -207,6 +221,7 @@ fn rust_main(cpuid: usize, host_dtb: usize) {
         #[cfg(target_arch = "loongarch64")]
         {
             clear_bss();
+            print_logo();
         }
         percpu::init();
         memory::heap::init();
@@ -217,6 +232,11 @@ fn rust_main(cpuid: usize, host_dtb: usize) {
     percpu::init_percpu_reg(cpuid);
 
     let cpu = PerCpu::new(cpuid);
+
+    #[cfg(target_arch = "loongarch64")] {
+        use crate::arch::timer::timer_init;
+        timer_init();
+    }
 
     println!(
         "Booting CPU {}: {:p} arch:{:p}, DTB: {:#x}",

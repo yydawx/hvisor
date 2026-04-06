@@ -58,8 +58,8 @@ pub fn primary_init_late() {
     info!("loongarch64: irqchip: primary_init_late: testing UART1");
     crate::device::uart::loongson_uart::__test_uart1();
 
-    info!("loongarch64: irqchip: primary_init_late: probing pci");
-    probe_pci();
+    // info!("loongarch64: irqchip: primary_init_late: probing pci");
+    // probe_pci();
 
     info!("loongarch64: irqchip: primary_init_late: clearing extioi SR regs");
     clear_extioi_sr();
@@ -96,7 +96,7 @@ pub fn percpu_init() {
     clear_all_ipi(this_pcpu_id);
     enable_ipi(this_pcpu_id);
     ecfg_ipi_enable();
-    clock_cpucfg_dump();
+    // clock_cpucfg_dump();
     // timer_test_tick();
 }
 

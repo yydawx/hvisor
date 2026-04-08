@@ -17,6 +17,7 @@
 //
 use crate::arch::cpu::this_cpu_id;
 use crate::consts::{IPI_EVENT_CLEAR_INJECT_IRQ, MAX_CPU_NUM};
+use crate::event::{IPI_EVENT_VIRTIO_INJECT_IRQ, IPI_EVENT_WAKEUP, IPI_EVENT_SHUTDOWN, IPI_EVENT_WAKEUP_VIRTIO_DEVICE};
 use crate::cpu_data::{get_cpu_data, this_zone};
 use crate::device::common::MMIODerefWrapper;
 use core::arch::asm;
@@ -36,8 +37,20 @@ pub fn arch_send_event(cpu_id: u64, sgi_num: u64) {
         "loongarch64: arch_send_event: sending event to cpu: {}, sgi_num: {}",
         cpu_id, sgi_num
     );
-    // just call ipi_write_action
-    ipi_write_action(cpu_id as usize, sgi_num as usize);
+
+    if sgi_num == IPI_EVENT_WAKEUP as u64 {
+        ipi_send_general(cpu_id as usize, SMP_BOOT_CPU as u32);
+    } else if sgi_num == IPI_EVENT_SHUTDOWN as u64 {
+        ipi_send_general(cpu_id as usize, HVISOR_SHUTDOWN as u32);
+    } else if sgi_num == IPI_EVENT_VIRTIO_INJECT_IRQ as u64 {
+        ipi_send_general(cpu_id as usize, HVISOR_EVENT_VIRTIO_INJECT_IRQ as u32);
+    } else if sgi_num == IPI_EVENT_WAKEUP_VIRTIO_DEVICE as u64  {
+        ipi_send_general(cpu_id as usize, HVISOR_EVENT_WAKEUP_VIRTIO_DEVICE as u32);
+    } else if sgi_num == IPI_EVENT_CLEAR_INJECT_IRQ as u64 {
+        ipi_send_general(cpu_id as usize, HVISOR_EVENT_VIRTIO_CLEAR_IRQ as u32);    
+    } else {
+        panic!("unknown sgi_num, {}", sgi_num);
+    }
 }
 
 register_bitfields! [
@@ -108,7 +121,9 @@ pub const HVISOR_START_VCPU: usize = 0x8;
 
 // boneinscri 2026.04
 pub const HVISOR_SHUTDOWN: usize = 0x40;
-
+pub const HVISOR_EVENT_VIRTIO_INJECT_IRQ: usize = 0x80;
+pub const HVISOR_EVENT_WAKEUP_VIRTIO_DEVICE: usize = 0x100;
+pub const HVISOR_EVENT_VIRTIO_CLEAR_IRQ: usize = 0x200;
 
 fn iocsr_mbuf_send_box_lo(a: usize) -> usize {
     a << 1

@@ -30,6 +30,7 @@ use crate::consts::{IPI_EVENT_CLEAR_INJECT_IRQ, MAX_CPU_NUM};
 use crate::cpu_data::{get_cpu_data, this_cpu_data};
 use crate::device::irqchip::{inject_irq, ls7a2000::clear_irq};
 use crate::device::irqchip::ls7a2000::chip::*;
+use crate::device::virtio_trampoline::handle_virtio_irq;
 use crate::event::{check_events, dump_cpu_events, dump_events};
 use crate::hypercall::{SGI_IPI_ID, *};
 use crate::memory::{addr, mmio_handle_access, MMIOAccess};
@@ -407,7 +408,7 @@ fn handle_exception(
             handle_hvc(ctx);
         }
         ECODE_PIL | ECODE_PIS | ECODE_PNR => {
-            debug!("exception: {}: ecode={:#x}, esubcode={:#x}, era={:#x}, is={:#x}, badi={:#x}, badv={:#x}",
+            info!("exception: {}: ecode={:#x}, esubcode={:#x}, era={:#x}, is={:#x}, badi={:#x}, badv={:#x}",
                     ecode2str(ecode,esubcode), ecode, esubcode, era, is, badi, badv);
             // we first assume this lies in virtio region
             // since we didn't add these regions into VMM Pages
@@ -1370,12 +1371,26 @@ fn handle_interrupt(is: usize) {
             }
         }
         else if pcpu_ipi_status & HVISOR_SHUTDOWN != 0 {
+            // if pcpu_data.arch_cpu.power_on == false {
+            //     panic!("pcpu : {} has not power on, this should not happen", pcpu_id_this);
+            // }
+            ipistate.status &= !(ipi_status as u32);
+            drop(ipistate);
+            pcpu_data.arch_cpu.idle();
+        } 
+        else if pcpu_ipi_status & HVISOR_EVENT_VIRTIO_INJECT_IRQ != 0 {
             if pcpu_data.arch_cpu.power_on == false {
                 panic!("pcpu : {} has not power on, this should not happen", pcpu_id_this);
             }
             ipistate.status &= !(ipi_status as u32);
             drop(ipistate);
-            pcpu_data.arch_cpu.idle();
+            handle_virtio_irq();
+        } 
+        else if pcpu_ipi_status & HVISOR_EVENT_WAKEUP_VIRTIO_DEVICE != 0 {
+            panic!("HVISOR_EVENT_WAKEUP_VIRTIO_DEVICE, not tested");
+        }
+        else if pcpu_ipi_status & HVISOR_EVENT_VIRTIO_CLEAR_IRQ != 0 {
+            panic!("HVISOR_EVENT_VIRTIO_CLEAR_IRQ, not tested");
         }
         else if pcpu_ipi_status != 0 {
             drop(ipistate);

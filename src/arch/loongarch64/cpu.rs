@@ -390,18 +390,22 @@ impl ArchCpu {
         let zone_id = this_zone_id();
         if zone_id == 0 {
             this_cpu_data().cpu_on_entry = boot_ctx.start_image;
-            this_zone().write().efi_system_table = boot_ctx.efi_system_table;
-            info!("boot_ctx.efi_system_table: {:#x?}, zone.efi_system_table: {:#x?}",
-                boot_ctx.efi_system_table, this_zone().read().efi_system_table);
+            info!("boot_ctx.efi_system_table: {:#x?}", boot_ctx.efi_system_table);
             self.ctx.x[4] = boot_ctx.image_handle;
             self.ctx.x[5] = 0;
             self.ctx.x[6] = 0;
             info!("a0={:#x?} a1={:#x?} a2={:#x?}", self.ctx.x[4], self.ctx.x[5], self.ctx.x[6]);
         } else {
-            snap.dmw0 = read_gcsr_dmw0();
-            snap.dmw1 = read_gcsr_dmw1();
-            snap.dmw2 = read_gcsr_dmw2();
-            snap.dmw3 = read_gcsr_dmw3();
+            self.ctx.x[4] = 1;
+            self.ctx.x[5] = boot_ctx.cmd_line_ptr;
+            self.ctx.x[6] = boot_ctx.efi_system_table;
+            info!("zone: {} x[4](a0)={:#x}, x[5](a1/cmd_line_ptr)={:#x}, x[6](a2/efi_system_table)={:#x}",
+                zone_id, self.ctx.x[4], self.ctx.x[5], self.ctx.x[6]);
+
+            snap.dmw0 = read_csr_dmw0();
+            snap.dmw1 = read_csr_dmw1();
+            snap.dmw2 = read_csr_dmw2();
+            snap.dmw3 = read_csr_dmw3();
             if this_cpu_data().cpu_on_entry & 0xffff_0000_0000_0000 == 0 {
                 snap.dmw1 &= 0x0000_ffff_ffff_ffff; // for npucore
             }
@@ -409,7 +413,7 @@ impl ArchCpu {
 
         if !self.init {
             self.init(this_cpu_data().cpu_on_entry, this_cpu_data().id, 0);
-            self.init = true;
+            self.init=  true;
         }
 
         self.ctx.x[1]  = boot_ctx.ra;

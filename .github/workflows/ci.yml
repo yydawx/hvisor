@@ -117,6 +117,10 @@ jobs:
             board: "phytium-pi"
             rustc_target: aarch64-unknown-none
             runs-on: ubuntu-latest
+          - arch: aarch64
+            board: "sysoul_x3300"
+            rustc_target: aarch64-unknown-none
+            runs-on: ubuntu-latest
           # riscv64
           - arch: riscv64
             board: "qemu-aia"

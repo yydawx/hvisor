@@ -27,7 +27,7 @@ pub const ROOT_ZONE_DTB_ADDR: u64 = 0x10000f000;
 pub const ROOT_ZONE_KERNEL_ADDR: u64 = 0x200000;
 pub const ROOT_ZONE_ENTRY: u64 = 0xe71000;
 // pub const ROOT_ZONE_CPUS: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7);
-pub const ROOT_ZONE_CPUS: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
+pub const ROOT_ZONE_CPUS: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) ;
 
 pub const ROOT_ZONE_NAME: &str = "root-linux-la64";
 
@@ -102,103 +102,51 @@ pub const ROOT_ZONE_MEMORY_REGIONS: &[HvConfigMemoryRegion] = &[
         size: 0x1000,
     }, // IO
 
-    // 46f000000-47f7fffff
-    HvConfigMemoryRegion {
-        mem_type: MEM_TYPE_RAM,
-        physical_start: 0x46f000000,
-        virtual_start:  0x46f000000,
-        size: 0x10800000,
-    }, // Reserved RAM
-
-    // 47f800000 - 47fffffff
-    HvConfigMemoryRegion {
-        mem_type: MEM_TYPE_RAM,
-        physical_start: 0x47f800000,
-        virtual_start:  0x47f800000,
-        size: 0x800000,
-    }, // Reserved RAM
-    
     // ====== for start_image ======
-    // 0x90000000 - 0xf9ffffff 0x6a000000
-    // 0xf7000000 - 0xf7ffffff 0x1000000
-    //(0xf9000000 - 0xf9ffffff 0x1000000)
-    // 0xfa000000 - 0xfaffffff 0x1000000
-    // 0xfb000000 - 0xfbffffff 0x1000000
-    // 0xfc000000 - 0xfcffffff 0x1000000
-    // 0xfd000000 - 0xfdffffff 0x1000000
-    // 0xfe000000 - 0xfeffffff 0x1000000
     HvConfigMemoryRegion {
         mem_type: MEM_TYPE_RAM,
         physical_start: 0x90000000,
         virtual_start:  0x90000000,
         size: 0x6a000000,
-    }, // RAM
+    }, // RAM 0x90000000 ~ 0xf9ffffff
 
     HvConfigMemoryRegion {
         mem_type: MEM_TYPE_RAM,
         physical_start: 0xfa000000,
         virtual_start:  0xfa000000,
         size: 0x5000000,
-    }, // RAM
-
-    // 0x800000000 ～ 0x87fffffff
-    HvConfigMemoryRegion {
-        mem_type: MEM_TYPE_RAM,
-        physical_start: 0x800000000,
-        virtual_start:  0x800000000,
-        size: 0x80000000,
-    }, // RAM
-
-    HvConfigMemoryRegion {
-        mem_type: MEM_TYPE_RAM,
-        physical_start: 0x700000000,
-        virtual_start:  0x700000000,
-        size: 0x100000000,
-    }, // RAM
-
+    }, // RAM 0xfa000000 ~ 0xfeffffff
     // ==== for start_image ====
 
     // addition
     HvConfigMemoryRegion {
         mem_type: MEM_TYPE_IO,
-        // mem_type: MEM_TYPE_PCH_PCI,
         physical_start: 0x10000000,
         virtual_start:  0x10000000,
         size: 0x1000,
-    }, // IO!!!!????? PCH-PCI
-    
+    }, // IO PCH-PCI
+
     HvConfigMemoryRegion {
         mem_type: MEM_TYPE_IO,
         physical_start: 0x10002000,
         virtual_start:  0x10002000,
         size: 0x1000,
-    }, // IO!!!!?????
+    }, // IO
 
     HvConfigMemoryRegion {
         mem_type: MEM_TYPE_IO,
         physical_start: 0x10010000,
         virtual_start:  0x10010000,
         size: 0x1000,
-    }, // IO!!!!?????
+    }, // IO
 
-    // ===========unknown region===============
-    // addition
+    // 0x100000000 ~ 0x87fffffff （30GB)
     HvConfigMemoryRegion {
         mem_type: MEM_TYPE_RAM,
         physical_start: 0x100000000,
         virtual_start:  0x100000000,
-        size: 0x200000000,
-        // size: 0xe0000000,
+        size: 0x780000000,
     }, // RAM
-
-    // HvConfigMemoryRegion {
-    //     mem_type: MEM_TYPE_RAM,
-    //     physical_start: 0x200000000,
-    //     virtual_start:  0x200000000,
-    //     size: 0x100000000,
-    //     // size: 0x10000,
-    // }, // RAM
-    // =========unknown region======
 
     HvConfigMemoryRegion {
         mem_type: MEM_TYPE_IO,

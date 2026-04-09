@@ -1362,7 +1362,9 @@ fn handle_interrupt(is: usize) {
                 panic!("can't reach here");
             } else {
                 // this is not the first cpu in the zone, read smpboot_entry from ipistate.buf
-                let smpboot_entry = ipistate.buf[first_pcpu_id] as usize;
+                // let smpboot_entry = ipistate.buf[first_pcpu_id] as usize;
+                let smpboot_entry = ipistate.buf[0] as usize;
+                // note!, always fetch smpboot_entry from cpu[0]! boneinscri 2026.04
                 warn!("pcpu_ipi_status = {:#x}, first_pcpu_id = {:#x}, smpboot_entry: {:#x}, pcpu_ipi_status = {:#x}", 
                 pcpu_ipi_status, first_pcpu_id, smpboot_entry, ipistate.status as usize);
                 drop(ipistate);// remember! avoid deadlock

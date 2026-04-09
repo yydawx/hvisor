@@ -463,7 +463,7 @@ pub struct LoongArch64IpiState {
     pub en: u32,
     pub set: u32,
     pub clear: u32,
-    pub buf: [u64; 4],
+    pub buf: [u64; MAX_CPU_NUM],
 }
 
 impl LoongArch64IpiState {
@@ -473,7 +473,7 @@ impl LoongArch64IpiState {
             en: 0,
             set: 0,
             clear: 0,
-            buf: [0; 4],
+            buf: [0; MAX_CPU_NUM],
         }
     }
 }

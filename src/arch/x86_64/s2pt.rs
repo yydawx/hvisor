@@ -258,6 +258,7 @@ pub struct S2PTInstr;
 impl PagingInstr for S2PTInstr {
     unsafe fn activate(root_paddr: HostPhysAddr) {
         let s2ptp = S2PTPointer::from_table_phys(root_paddr).bits();
+        info!("[EPT] Activating EPT: root_paddr={:#x}, EPTP={:#x}", root_paddr, s2ptp);
         crate::arch::vmcs::VmcsControl64::EPTP.write(s2ptp).unwrap();
         unsafe { invs2pt(InvS2PTType::SingleContext, s2ptp) };
 
@@ -265,6 +266,7 @@ impl PagingInstr for S2PTInstr {
         if this_cpu_data().arch_cpu.power_on && this_cpu_data().boot_cpu {
             iommu::fill_dma_translation_tables(this_zone_id(), root_paddr);
         }
+        info!("[EPT] EPT activated successfully");
     }
 
     fn flush(_vaddr: Option<usize>) {}

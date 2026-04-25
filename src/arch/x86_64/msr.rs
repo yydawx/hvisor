@@ -204,6 +204,12 @@ impl MsrBitmap {
         bitmap.set_write_intercept(IA32_X2APIC_ICR, true);
         bitmap.set_write_intercept(IA32_X2APIC_LVT_TIMER, true);
 
+        // Intercept FS_BASE and GS_BASE MSR access to properly handle them
+        bitmap.set_read_intercept(IA32_FS_BASE, true);
+        bitmap.set_read_intercept(IA32_GS_BASE, true);
+        bitmap.set_write_intercept(IA32_FS_BASE, true);
+        bitmap.set_write_intercept(IA32_GS_BASE, true);
+
         for addr in (IA32_X2APIC_ISR0 as u32)..(IA32_X2APIC_ISR7 as u32 + 1) {
             if let Ok(msr) = Msr::try_from(addr) {
                 bitmap.set_read_intercept(msr, true);

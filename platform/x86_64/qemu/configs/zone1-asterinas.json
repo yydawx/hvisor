@@ -1,0 +1,39 @@
+{
+    "name": "asterinas",
+    "zone_id": 1,
+    "cpus": [1],
+    "memory_regions": [
+        {
+            "type": "ram",
+            "physical_start": "0x80000000",
+            "virtual_start": "0x80000000",
+            "size": "0x40000000"
+        }
+    ],
+    "interrupts": [],
+    "ivc_configs": [],
+    "kernel_filepath": "./asterinas.elf",
+    "dtb_filepath": "null",
+    "kernel_load_paddr": "0x80000000",
+    "dtb_load_paddr": "0x00000000",
+    "entry_point": "0x80000000",
+    "multiboot_enabled": true,
+    "multiboot_info_paddr": "0x82000000",
+    "kernel_cmdline": "console=hvc0 root=/dev/vda rw",
+    "arch_config": {
+        "ioapic_base": "0xfec00000",
+        "ioapic_size": "0x1000",
+        "kernel_entry_gpa": "0x80000000",
+        "cmdline_load_gpa": "0x82010000",
+        "setup_load_gpa": "0x80000",
+        "initrd_load_gpa": "0x0",
+        "initrd_size": "0x0",
+        "rsdp_memory_region_id": 0,
+        "acpi_memory_region_id": 0,
+        "uefi_memory_region_id": 0,
+        "screen_base": "0x0"
+    },
+    "pci_config": [],
+    "num_pci_devs": 0,
+    "alloc_pci_devs": []
+}

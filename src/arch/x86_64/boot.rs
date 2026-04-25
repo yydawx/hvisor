@@ -174,8 +174,15 @@ pub struct BootParams {
 
 impl BootParams {
     pub fn fill(config: &HvZoneConfig, gpm: &mut MemorySet<Stage2PageTable>) -> HvResult {
-        if config.arch_config.setup_load_gpa == 0 {
+        // Skip setup address check for Multiboot mode
+        if config.arch_config.setup_load_gpa == 0 && config.multiboot_enabled == 0 {
             panic!("setup addr not set yet!");
+        }
+
+        // If multiboot is enabled, we don't need boot params
+        if config.multiboot_enabled != 0 {
+            info!("[MULTIBOOT] Skipping boot params fill for Multiboot mode");
+            return Ok(());
         }
 
         let boot_params_hpa = unsafe {

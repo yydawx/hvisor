@@ -100,16 +100,72 @@ impl Zone {
 
     /// called after cpu_set is initialized
     pub fn arch_zone_pre_configuration(&mut self, config: &HvZoneConfig) -> HvResult {
-        self.cpu_set.iter().for_each(|cpuid| {
-            let cpu_data = get_cpu_data(cpuid);
-            // boot cpu
-            if cpuid == self.cpu_set.first_cpu().unwrap() {
-                cpu_data.arch_cpu.set_boot_cpu_vm_launch_regs(
-                    config.arch_config.kernel_entry_gpa as _,
-                    config.arch_config.setup_load_gpa as _,
-                );
+        let zone_id = config.zone_id as usize;
+
+        // Check if this is zone1 (Multiboot2) or zone0 (Linux)
+        if zone_id != 0 && config.multiboot_enabled != 0 {
+            // Zone1 with Multiboot2 - use Multiboot2 boot mode
+            info!("[ZONE{}] Using Multiboot2 boot mode", zone_id);
+            info!("[ZONE{}] multiboot_enabled={}, config.multiboot_info_paddr={:#x}",
+                  zone_id, config.multiboot_enabled, config.multiboot_info_paddr);
+
+            // Use kernel's existing GDT at GPA 0x80014f0
+            // The kernel's GDT has:
+            // - Selector 0x08: 64-bit code segment
+            // - Selector 0x10: Data segment
+            // - Selector 0x18: 32-bit code segment
+            //
+            // We need a TSS for VMX. Put it at GPA 0x8048000 (below stack at 0x804a000)
+            // DO NOT use 0x8009000 - that's kernel boot code!
+            let tss_gpa = 0x8048000usize;
+            if let Ok((tss_hpa, _, _)) = unsafe { self.gpm.page_table_query(tss_gpa) } {
+                let tss_ptr = tss_hpa as *mut u8;
+                unsafe {
+                    // Zero out 104 bytes (32-bit TSS size)
+                    for i in 0..104 {
+                        core::ptr::write_volatile(tss_ptr.add(i), 0);
+                    }
+                }
+                info!("[ZONE{}] TSS written to GPA {:#x} (HPA {:#x})", zone_id, tss_gpa, tss_hpa);
+            } else {
+                warn!("[ZONE{}] Failed to write TSS: GPA {:#x} not mapped", zone_id, tss_gpa);
             }
-        });
+
+            // Add TSS descriptor to kernel's GDT at entry 4 (selector 0x20)
+            // TSS descriptor: Base=0x8048000, Limit=0x67, Type=0x89 (32-bit available TSS)
+            let tss_descriptor: u64 = 0x0080890480000067;
+            let gdt_entry4_gpa = 0x80014f0 + 4 * 8;  // Entry 4 at offset 32
+            if let Ok((gdt_hpa, _, _)) = unsafe { self.gpm.page_table_query(gdt_entry4_gpa) } {
+                let gdt_ptr = gdt_hpa as *mut u64;
+                unsafe {
+                    core::ptr::write_volatile(gdt_ptr, tss_descriptor);
+                }
+                info!("[ZONE{}] TSS descriptor written to GDT entry 4 at GPA {:#x}", zone_id, gdt_entry4_gpa);
+            }
+
+            self.cpu_set.iter().for_each(|cpuid| {
+                let cpu_data = get_cpu_data(cpuid);
+                if cpuid == self.cpu_set.first_cpu().unwrap() {
+                    cpu_data.arch_cpu.set_multiboot_mode(true);
+                    cpu_data.arch_cpu.set_multiboot_boot_regs(
+                        config.multiboot_info_paddr as _,
+                    );
+                    info!("[ZONE{}] Multiboot2: EAX=0x36D76289, EBX=0x{:x}",
+                        zone_id, config.multiboot_info_paddr);
+                }
+            });
+        } else {
+            self.cpu_set.iter().for_each(|cpuid| {
+                let cpu_data = get_cpu_data(cpuid);
+                if cpuid == self.cpu_set.first_cpu().unwrap() {
+                    cpu_data.arch_cpu.set_multiboot_mode(false);
+                    cpu_data.arch_cpu.set_boot_cpu_vm_launch_regs(
+                        config.arch_config.kernel_entry_gpa as _,
+                        config.arch_config.setup_load_gpa as _,
+                    );
+                }
+            });
+        }
 
         set_msr_bitmap(config.zone_id as _);
         set_pio_bitmap(config.zone_id as _);
@@ -145,7 +201,14 @@ impl Zone {
         }*/
 
         boot::BootParams::fill(&config, &mut self.gpm);
-        acpi::copy_to_guest_memory_region(&config, &self.cpu_set);
+
+        // Skip ACPI table copy for Multiboot mode - the kernel will handle hardware discovery
+        // Also, config.acpi_memory_region_id = 0 would overwrite kernel code at GPA 0x8000000
+        if config.multiboot_enabled == 0 {
+            acpi::copy_to_guest_memory_region(&config, &self.cpu_set);
+        } else {
+            info!("[ZONE{}] Skipping ACPI table copy for Multiboot mode", config.zone_id);
+        }
 
         Ok(())
     }

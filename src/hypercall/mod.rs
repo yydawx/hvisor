@@ -177,6 +177,11 @@ impl<'a> HyperCall<'a> {
         let config_pa = self.hv_get_real_pa(config_ipa);
         let config = unsafe { &*(config_pa as *const HvZoneConfig) };
 
+        info!("[ZONE_START] hv_zone_start called for zone_id={}, config_size={}, expected={}", 
+              config.zone_id, config_size, core::mem::size_of::<HvZoneConfig>());
+        info!("[ZONE_START] kernel_load_paddr={:#x}, entry_point={:#x}", 
+              config.kernel_load_paddr, config.entry_point);
+
         debug!("hv_zone_start: config: {:#x?}", config);
         if !is_this_root_zone() {
             return hv_result_err!(

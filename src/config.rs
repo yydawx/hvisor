@@ -23,7 +23,7 @@ pub const MEM_TYPE_RAM: u32 = 0;
 pub const MEM_TYPE_IO: u32 = 1;
 pub const MEM_TYPE_VIRTIO: u32 = 2;
 
-pub const CONFIG_MAGIC_VERSION: usize = 0x5;
+pub const CONFIG_MAGIC_VERSION: usize = 0x6;
 pub const CONFIG_MAX_MEMORY_REGIONS: usize = 64;
 
 pub type BitmapWord = u32;
@@ -101,6 +101,9 @@ pub struct HvZoneConfig {
     pub dtb_load_paddr: u64,
     pub dtb_size: u64,
     pub name: [u8; CONFIG_NAME_MAXLEN],
+    // Multiboot support (NEW)
+    pub multiboot_info_paddr: u64,
+    pub multiboot_enabled: u32,
     pub arch_config: HvArchZoneConfig,
     pub num_pci_bus: u64,
     pub pci_config: [HvPciConfig; CONFIG_PCI_BUS_MAXNUM],
@@ -144,6 +147,8 @@ impl HvZoneConfig {
             dtb_load_paddr,
             dtb_size,
             name,
+            multiboot_info_paddr: 0,
+            multiboot_enabled: 0,
             arch_config: arch,
             num_pci_bus,
             pci_config: pci,

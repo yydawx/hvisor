@@ -202,13 +202,60 @@ impl Zone {
 
         boot::BootParams::fill(&config, &mut self.gpm);
 
-        // Skip ACPI table copy for Multiboot mode - the kernel will handle hardware discovery
-        // Also, config.acpi_memory_region_id = 0 would overwrite kernel code at GPA 0x8000000
-        if config.multiboot_enabled == 0 {
-            acpi::copy_to_guest_memory_region(&config, &self.cpu_set);
-        } else {
-            info!("[ZONE{}] Skipping ACPI table copy for Multiboot mode", config.zone_id);
-        }
+        // Copy ACPI tables for all zones (including Multiboot2 mode).
+        // Zone1 uses dedicated RSDP region (ID 1) and ACPI region (ID 3)
+        // at non-conflicting GPAs (0xe0000 and 0x1ff00000 respectively).
+        acpi::copy_to_guest_memory_region(&config, &self.cpu_set);
+
+        // Map PCI ECAM region into guest EPT so the guest can access PCI config space.
+        // The MCFG table tells the guest ECAM is at HPA 0xb0000000, which becomes
+        // GPA 0xb0000000 when copied into guest ACPI tables. Without this mapping,
+        // any PCI config access causes an EPT violation.
+        let ecam_base = 0xb000_0000usize;
+        let ecam_size = 0x20_0000usize;
+        self.gpm.insert(MemoryRegion::new_with_offset_mapper(
+            ecam_base as GuestPhysAddr,
+            ecam_base as HostPhysAddr,
+            ecam_size,
+            MemFlags::READ | MemFlags::WRITE,
+        ));
+
+        // Map PCI 32-bit MMIO window so the guest can access PCI device BARs.
+        // QEMU Q35 assigns 32-bit PCI MMIO BARs in the 0xC0000000-0xFEBFFFFF range,
+        // up to just below the IOAPIC at 0xFEC00000.
+        let pci_mmio_base = 0xC000_0000usize;
+        let pci_mmio_size = 0x3EC0_0000usize;  // ~1004MB, up to IOAPIC
+        self.gpm.insert(MemoryRegion::new_with_offset_mapper(
+            pci_mmio_base as GuestPhysAddr,
+            pci_mmio_base as HostPhysAddr,
+            pci_mmio_size,
+            MemFlags::READ | MemFlags::WRITE,
+        ));
+
+        // Map DMA memory region: cover the guest's I/O memory allocator low range
+        // (0x20000000..0xB0000000, i.e. up to ECAM) using HPA 0x1_0000_0000
+        // (4GB, reserved for zone1 by zone0).
+        let dma_gpa_base = 0x2000_0000usize;
+        let dma_hpa_base = 0x1_0000_0000usize;
+        let dma_size = 0x9000_0000usize;  // 2.25GB, up to ECAM at 0xB0000000
+        self.gpm.insert(MemoryRegion::new_with_offset_mapper(
+            dma_gpa_base as GuestPhysAddr,
+            dma_hpa_base as HostPhysAddr,
+            dma_size,
+            MemFlags::READ | MemFlags::WRITE,
+        ));
+
+        // Map 64-bit PCI BAR window. QEMU assigns 64-bit BARs (e.g. virtio-blk
+        // modern transport BAR) at high addresses like 0x800000000 (32GB).
+        // Identity-map a window there so the guest can access them.
+        let pci_bar64_base = 0x8_0000_0000usize;   // 32GB
+        let pci_bar64_size = 0x1000_0000usize;    // 256MB
+        self.gpm.insert(MemoryRegion::new_with_offset_mapper(
+            pci_bar64_base as GuestPhysAddr,
+            pci_bar64_base as HostPhysAddr,
+            pci_bar64_size,
+            MemFlags::READ | MemFlags::WRITE,
+        ));
 
         Ok(())
     }

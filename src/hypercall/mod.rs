@@ -139,12 +139,30 @@ impl<'a> HyperCall<'a> {
                 "Virtio send irq operation over non-root zones: unsupported!"
             );
         }
-        let mut res_agent = VIRTIO_BRIDGE.res_agent();
+        let mut res_agent = match VIRTIO_BRIDGE.res_agent() {
+            Some(agent) => agent,
+            None => return HyperCallResult::Ok(0),
+        };
         let mut map_irq = VIRTIO_IRQS.lock();
         while !res_agent.is_empty() {
             let (_res_front, irq_id, target_zone) = res_agent.peek_front();
             let target_cpu = match find_zone(target_zone as _) {
-                Some(_zone) => get_target_cpu(irq_id as _, target_zone as _),
+                Some(zone_arc) => {
+                    let target_cpu = get_target_cpu(irq_id as _, target_zone as _);
+                    // Verify target_cpu belongs to target_zone.
+                    // The guest IOAPIC may route IRQs to an APIC ID that now
+                    // belongs to a different zone, which would cause the IRQ
+                    // to be injected into the wrong guest.
+                    let zone = zone_arc.read();
+                    if zone.cpu_set.bitmap & (1u64 << target_cpu) != 0 {
+                        target_cpu
+                    } else {
+                        trace!("virtio: IRQ {} for zone {} routed to CPU {} outside zone, falling back to CPU {}",
+                              irq_id, target_zone, target_cpu,
+                              zone.cpu_set.first_cpu().unwrap());
+                        zone.cpu_set.first_cpu().unwrap()
+                    }
+                }
                 _ => {
                     res_agent.advance_front();
                     continue;

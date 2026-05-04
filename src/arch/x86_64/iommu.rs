@@ -291,6 +291,13 @@ impl Vtd {
             .map(|(&bdf, _)| (bdf.get_bits(8..=15) as u8, bdf.get_bits(0..=7) as u8))
             .collect();
 
+        // Early return if zone has no PCI devices. Calling invalid_iotlb
+        // on an empty domain triggers a QEMU VT-d caching-mode emulation bug
+        // that corrupts IOMMU state for ALL domains, breaking zone0 DMA.
+        if bdfs.is_empty() {
+            return;
+        }
+
         for (bus, dev_func) in bdfs {
             self.update_context_entry(bus, dev_func, 0, false);
         }
@@ -408,6 +415,10 @@ impl Vtd {
             .filter(|&(_, &dev_zone_id)| dev_zone_id == zone_id)
             .map(|(&bdf, _)| (bdf.get_bits(8..=15) as u8, bdf.get_bits(0..=7) as u8))
             .collect();
+
+        if bdfs.is_empty() {
+            return;
+        }
 
         for (bus, dev_func) in bdfs {
             self.update_context_entry(bus, dev_func, zone_s2pt_hpa, true);

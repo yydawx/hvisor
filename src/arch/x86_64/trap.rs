@@ -106,10 +106,26 @@ fn handle_irq(vector: u8) {
         IdtVector::VIRT_IPI_VECTOR => {
             ipi::handle_virt_ipi();
         }
-        IdtVector::APIC_SPURIOUS_VECTOR | IdtVector::APIC_ERROR_VECTOR => {}
+        IdtVector::APIC_SPURIOUS_VECTOR
+        | IdtVector::APIC_ERROR_VECTOR
+        | IdtVector::APIC_TIMER_VECTOR => {}
         _ => {
             if vector >= 0x20 && this_cpu_data().arch_cpu.power_on {
-                inject_vector(this_cpu_id(), vector, None, false);
+                let cpu_id = this_cpu_id();
+                let zone_id = this_zone_id();
+                // LAPIC-local interrupts (timer, etc.) fire on whichever CPU
+                // programmed the LAPIC. They belong to the CURRENT zone,
+                // not zone0. Device interrupts (0x20-0xdf) always belong to
+                // zone0 and must be forwarded if they arrive on a non-zone0 CPU.
+                let is_lapic_local = vector >= 0xe0;
+                if zone_id == 0 || is_lapic_local {
+                    inject_vector(cpu_id, vector, None, false);
+                } else {
+                    // Forward device interrupt to zone0.
+                    let zone0 = crate::zone::find_zone(0).unwrap();
+                    let zone0_cpu = zone0.read().cpu_set.first_cpu().unwrap_or(0);
+                    inject_vector(zone0_cpu, vector, None, false);
+                }
             }
         }
     }
@@ -408,39 +424,38 @@ fn handle_io_instruction(arch_cpu: &mut ArchCpu, exit_info: &VmxExitInfo) -> HvR
 fn handle_msr_read(arch_cpu: &mut ArchCpu) -> HvResult {
     let rcx = arch_cpu.regs().rcx as u32;
 
-    if let Ok(msr) = Msr::try_from(rcx) {
-        let res: HvResult<u64> = if msr == IA32_APIC_BASE {
-            let mut apic_base = unsafe { IA32_APIC_BASE.read() };
-            // info!("APIC BASE: {:x}", apic_base);
-            apic_base |= 1 << 11 | 1 << 10; // enable xAPIC and x2APIC
-            Ok(apic_base)
-        } else if VirtLocalApic::msr_range().contains(&rcx) {
+    let res: HvResult<u64> = if rcx == IA32_APIC_BASE as u32 {
+        let mut apic_base = unsafe { IA32_APIC_BASE.read() };
+        apic_base |= 1 << 11 | 1 << 10; // report xAPIC and x2APIC enabled
+        Ok(apic_base)
+    } else if VirtLocalApic::msr_range().contains(&rcx) {
+        if let Ok(msr) = Msr::try_from(rcx) {
             arch_cpu.virt_lapic.rdmsr(msr)
-        } else if msr == IA32_GS_BASE {
-            // Read Guest GS_BASE from VMCS
-            match VmcsGuestNW::GS_BASE.read() {
-                Ok(v) => Ok(v as u64),
-                Err(_) => hv_result_err!(EIO),
-            }
+        } else {
+            // MSR not in our enum but in x2APIC range — return 0 (safe default).
+            Ok(0)
+        }
+    } else if let Ok(msr) = Msr::try_from(rcx) {
+        if msr == IA32_GS_BASE {
+            VmcsGuestNW::GS_BASE.read().map(|v| v as u64).map_err(|_| hv_err!(EIO))
         } else if msr == IA32_FS_BASE {
-            // Read Guest FS_BASE from VMCS
-            match VmcsGuestNW::FS_BASE.read() {
-                Ok(v) => Ok(v as u64),
-                Err(_) => hv_result_err!(EIO),
-            }
+            VmcsGuestNW::FS_BASE.read().map(|v| v as u64).map_err(|_| hv_err!(EIO))
         } else {
             hv_result_err!(ENOSYS)
-        };
+        }
+    } else {
+        hv_result_err!(ENOSYS)
+    };
 
-        if let Ok(value) = res {
+    match res {
+        Ok(value) => {
             debug!("VM exit: RDMSR({:#x}) -> {:#x}", rcx, value);
             arch_cpu.regs_mut().rax = value & 0xffff_ffff;
             arch_cpu.regs_mut().rdx = value >> 32;
-        } else {
-            warn!("Failed to handle RDMSR({:#x}): {:?}", rcx, res);
         }
-    } else {
-        // warn!("Unrecognized RDMSR({:#x})", rcx);
+        Err(e) => {
+            warn!("Failed to handle RDMSR({:#x}): {:?}", rcx, e);
+        }
     }
 
     arch_cpu.advance_guest_rip(VM_EXIT_INSTR_LEN_RDMSR)?;
@@ -449,33 +464,27 @@ fn handle_msr_read(arch_cpu: &mut ArchCpu) -> HvResult {
 
 fn handle_msr_write(arch_cpu: &mut ArchCpu) -> HvResult {
     let rcx = arch_cpu.regs().rcx as u32;
-    let msr = Msr::try_from(rcx).unwrap();
     let value = (arch_cpu.regs().rax & 0xffff_ffff) | (arch_cpu.regs().rdx << 32);
     debug!("VM exit: WRMSR({:#x}) <- {:#x}", rcx, value);
 
-    let res: HvResult<()> = if msr == IA32_APIC_BASE {
-        Ok(()) // ignore
-    } else if VirtLocalApic::msr_range().contains(&rcx) || msr == IA32_TSC_DEADLINE {
-        arch_cpu.virt_lapic.wrmsr(msr, value)
-    } else if msr == IA32_GS_BASE {
-        // Write Guest GS_BASE to VMCS
-        info!("[MSR] WRMSR GS_BASE <- {:#x}", value);
-        match VmcsGuestNW::GS_BASE.write(value as usize) {
-            Ok(()) => {
-                // Verify write
-                let read_back = VmcsGuestNW::GS_BASE.read().unwrap_or(0);
-                info!("[MSR] GS_BASE written, read back: {:#x}", read_back);
-                Ok(())
-            },
-            Err(_) => hv_result_err!(EIO),
+    let msr_opt = Msr::try_from(rcx).ok();
+
+    let res: HvResult<()> = if rcx == IA32_APIC_BASE as u32 {
+        Ok(()) // ignore — guest can't change APIC mode
+    } else if VirtLocalApic::msr_range().contains(&rcx) {
+        if let Some(msr) = msr_opt {
+            arch_cpu.virt_lapic.wrmsr(msr, value)
+        } else {
+            // x2APIC MSR not in our enum (e.g. SELF_IPI at 0x83F).
+            // Silently ignore — the guest thinks it succeeded.
+            Ok(())
         }
-    } else if msr == IA32_FS_BASE {
-        // Write Guest FS_BASE to VMCS
-        info!("[MSR] WRMSR FS_BASE <- {:#x}", value);
-        match VmcsGuestNW::FS_BASE.write(value as usize) {
-            Ok(()) => Ok(()),
-            Err(_) => hv_result_err!(EIO),
-        }
+    } else if msr_opt == Some(IA32_TSC_DEADLINE) {
+        arch_cpu.virt_lapic.wrmsr(IA32_TSC_DEADLINE, value)
+    } else if msr_opt == Some(IA32_GS_BASE) {
+        VmcsGuestNW::GS_BASE.write(value as usize).map_err(|_| hv_err!(EIO))
+    } else if msr_opt == Some(IA32_FS_BASE) {
+        VmcsGuestNW::FS_BASE.write(value as usize).map_err(|_| hv_err!(EIO))
     } else {
         hv_result_err!(ENOSYS)
     };
@@ -659,6 +668,22 @@ fn dump_instruction_bytes(rip: usize, num_bytes: usize) {
 fn handle_exception(arch_cpu: &mut ArchCpu, exit_info: &VmxExitInfo) -> HvResult {
     let int_info = VmxInterruptInfo::new()?;
 
+    // Check if the guest has set up its IDT yet.
+    // Once the guest IDT is valid, clear the exception bitmap so exceptions
+    // are delivered directly to the guest (QEMU reference: exception_bitmap = 0
+    // unconditionally). Keeping it 0xFFFFFFFF for a mature guest OS causes page
+    // faults and other exceptions to be intercepted, and re-injection can lose
+    // the fault address (CR2 may be overwritten during VMM processing).
+    let idtr_base = VmcsGuestNW::IDTR_BASE.read().unwrap_or(0);
+    if idtr_base != 0 {
+        let prev_bm = VmcsControl32::EXCEPTION_BITMAP.read().unwrap_or(0);
+        if prev_bm != 0 {
+            VmcsControl32::EXCEPTION_BITMAP.write(0).ok();
+            info!("[EXCEPTION] Guest IDT detected (IDTR base={:#x}), cleared exception_bitmap (was {:#x})",
+                  idtr_base, prev_bm);
+        }
+    }
+
     // Exception names
     let exception_names = [
         "#DE", "#DB", "NMI", "#BP", "#OF", "#BR", "#UD", "#NM",
@@ -719,6 +744,15 @@ fn handle_exception(arch_cpu: &mut ArchCpu, exit_info: &VmxExitInfo) -> HvResult
 
             // Dump instruction bytes at the fault RIP
             dump_instruction_bytes(rip, 16);
+
+            // Set CR2 to the faulting linear address before re-injecting #PF.
+            // Per Intel SDM Vol 3C 26.6.1.1, when VM-entry injects a page fault,
+            // the page-fault linear address is taken from CR2.  If CR2 was
+            // overwritten during VMM processing (e.g. by a host page fault during
+            // guest page-table walk), the guest #PF handler sees a bogus address.
+            if fault_vaddr != 0 {
+                unsafe { core::arch::asm!("mov cr2, {}", in(reg) fault_vaddr) };
+            }
 
             // Re-inject #PF to guest (guest handles it if IDT is set up)
             info!("  => Re-injecting #PF to guest (vector 14, error_code={:#x})", error_code);

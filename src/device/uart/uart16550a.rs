@@ -18,6 +18,7 @@ use crate::{
     arch::{graphics::fb_putchar, pio::UART_COM1_BASE_PORT},
     device::irqchip::inject_irq,
     error::HvResult,
+    zone::this_zone_id,
 };
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -229,8 +230,14 @@ impl VirtUart16550aUnlocked {
             self.iir = InterruptIdentFlags::NO_INTR_IS_PENDING.bits();
         } else {
             self.iir = iir;
-            // use COM1 irq
-            inject_irq(0x4, false);
+            // Only root zone uses physical interrupt injection for UART.
+            // Non-root zones get console I/O via virtio-console, not legacy UART
+            // interrupts.  Injecting UART interrupts into a non-root zone causes
+            // EOI-stuck storms because the guest has no UART interrupt handler —
+            // it expects a virtio-console device, not a physical 16550A.
+            if this_zone_id() == 0 {
+                inject_irq(0x4, false);
+            }
         }
     }
 }
@@ -283,8 +290,9 @@ impl VirtUart16550a {
             }
             UartReg::LINE_CTRL => uart.lcr,
             UartReg::LINE_STATUS => {
-                // check if the physical serial port has an available byte, and push it to FIFO.
-                if !uart.fifo.is_full() {
+                // Only root zone consumes input from the physical serial port.
+                // Non-root zones use virtio-console (hvc0) for interactive I/O.
+                if this_zone_id() == 0 && !uart.fifo.is_full() {
                     if let Some(c) = console_getchar() {
                         uart.fifo.push(c);
                     }

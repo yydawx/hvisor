@@ -300,7 +300,12 @@ impl ArchCpu {
 
         if per_cpu.boot_cpu {
             // must be called after activate_gpm()
-            iommu::activate();
+            // Only zone0 has PCI devices that need IOMMU DMA translation.
+            // Zone1 has no PCI devices, and calling activate() a second
+            // time might subtly corrupt QEMU VT-d cached state.
+            if this_zone_id() == 0 {
+                iommu::activate();
+            }
             self.guest_regs = self.vm_launch_guest_regs.clone();
             info!("[BOOT] CPU {} boot_cpu=true, copying vm_launch_guest_regs to guest_regs", self.cpuid);
             info!("[BOOT] guest_regs: RAX={:#x}, RBX={:#x}, RSI={:#x}",

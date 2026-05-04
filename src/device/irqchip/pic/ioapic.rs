@@ -22,6 +22,7 @@ use crate::{
         mmio::MMIoDevice,
         zone::HvArchZoneConfig,
     },
+    cpu_data::this_zone,
     device::irqchip::pic::inject_vector,
     error::HvResult,
     memory::{GuestPhysAddr, MMIOAccess},
@@ -167,10 +168,32 @@ impl VirtIoApic {
             let dest = get_cpu_id(entry.get_bits(56..=63) as usize);
             let masked = entry.get_bit(16);
             let vector = entry.get_bits(0..=7) as u8;
-            // info!("trigger hv: {:x} zone: {:x}", vector, zone_id);
             if !masked && vector >= 0x20 {
+                let this_zone_arc = this_zone();
+                let zone = this_zone_arc.read();
+                // The guest IOAPIC RTE may route to a CPU outside this zone.
+                // If so, redirect to the zone's first CPU so the interrupt
+                // reaches the correct guest.
+                let dest = if zone.cpu_set.bitmap & (1u64 << dest) != 0 {
+                    dest
+                } else {
+                    let fallback = zone.cpu_set.first_cpu().unwrap();
+                    trace!(
+                        "ioapic: IRQ {} dest CPU {} not in zone {}, using CPU {}",
+                        irq, dest, zone_id, fallback
+                    );
+                    fallback
+                };
+                drop(zone);
                 inject_vector(dest, vector, None, allow_repeat);
             }
+        } else {
+            warn!(
+                "ioapic trigger: IRQ {} out of range (max {}) for zone {}, ignoring",
+                irq,
+                IOAPIC_MAX_REDIRECT_ENTRIES,
+                zone_id
+            );
         }
         Ok(())
     }
@@ -224,10 +247,50 @@ pub fn ioapic_inject_irq(irq: u8, allow_repeat: bool) {
     VIRT_IOAPIC.get().unwrap().trigger(irq as _, allow_repeat);
 }
 
+/// When a non-root zone starts on a set of CPUs, ensure critical physical
+/// interrupts (UART, etc.) are not routed to those CPUs. If they are, re-route
+/// them to CPU 0 which stays in the root zone.  Without this, zone0 can become
+/// unresponsive because physical interrupts get injected into a guest that has
+/// no handler for them.
+pub fn ioapic_reroute_from_cpus(cpu_set: &crate::cpu_data::CpuSet) {
+    // Critical IRQs that the root zone needs for interactive console.
+    const CRITICAL_IRQS: &[u8] = &[irqs::UART_COM1_IRQ];
+
+    let mut io_apic = IO_APIC.lock();
+    for &irq in CRITICAL_IRQS {
+        // table_entry returns RedirectionTableEntry, transmute to u64 for
+        // bit-field manipulation.
+        let entry = unsafe { io_apic.table_entry(irq) };
+        let raw: u64 = unsafe { core::mem::transmute(entry) };
+        let dest_apic_id = raw.get_bits(56..=63) as usize;
+        let dest_cpu = get_cpu_id(dest_apic_id);
+        if cpu_set.bitmap & (1u64 << dest_cpu) != 0 {
+            // Re-route to CPU 0 which is always in the root zone.
+            let cpu0_apic_id = get_apic_id(0) as u64;
+            let mut new_raw = raw;
+            new_raw.set_bits(56..=63, cpu0_apic_id);
+            let new_entry = unsafe { core::mem::transmute(new_raw) };
+            unsafe { io_apic.set_table_entry(irq, new_entry) };
+            warn!(
+                "ioapic: rerouted IRQ {} from CPU {} (APIC {:#x}) to CPU 0 (APIC {:#x})",
+                irq, dest_cpu, dest_apic_id, cpu0_apic_id
+            );
+        }
+    }
+}
+
 pub fn get_irq_cpu(irq: usize, zone_id: usize) -> usize {
     VIRT_IOAPIC
         .get()
         .unwrap()
         .get_irq_cpu(irq, zone_id)
-        .unwrap()
+        .unwrap_or_else(|| {
+            warn!(
+                "get_irq_cpu: IRQ {} out of range (max {}) for zone {}, falling back to CPU 0",
+                irq,
+                IOAPIC_MAX_REDIRECT_ENTRIES,
+                zone_id
+            );
+            0
+        })
 }

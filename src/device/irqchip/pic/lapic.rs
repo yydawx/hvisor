@@ -34,6 +34,7 @@ pub struct VirtLocalApic {
     pub phys_lapic: LocalApic,
     pub virt_timer_vector: u8,
     virt_lvt_timer_bits: u32,
+    virt_svr: u32,
 }
 
 impl VirtLocalApic {
@@ -46,6 +47,7 @@ impl VirtLocalApic {
             ),
             virt_timer_vector: IdtVector::APIC_TIMER_VECTOR as _,
             virt_lvt_timer_bits: (1 << 16) as _, // masked
+            virt_svr: 0xFF, // APIC enabled, spurious vector 0xFF
         }
     }
 
@@ -73,36 +75,38 @@ impl VirtLocalApic {
 
     pub fn rdmsr(&mut self, msr: Msr) -> HvResult<u64> {
         match msr {
-            IA32_X2APIC_APICID => {
-                // info!("apicid: {:x}", this_cpu_id());
-                Ok(this_apic_id() as u64)
-            }
-            IA32_X2APIC_LDR => Ok(this_apic_id() as u64), // logical apic id
+            IA32_X2APIC_APICID => Ok(this_apic_id() as u64),
+            IA32_X2APIC_VERSION => Ok(0x1415), // version 0x14, max LVT entry 0x15
+            IA32_X2APIC_LDR => Ok(this_apic_id() as u64),
+            IA32_X2APIC_SIVR => Ok(self.virt_svr as u64),
             IA32_X2APIC_ISR0 | IA32_X2APIC_ISR1 | IA32_X2APIC_ISR2 | IA32_X2APIC_ISR3
-            | IA32_X2APIC_ISR4 | IA32_X2APIC_ISR5 | IA32_X2APIC_ISR6 | IA32_X2APIC_ISR7 => {
-                // info!("isr!");
-                Ok(0)
-            }
+            | IA32_X2APIC_ISR4 | IA32_X2APIC_ISR5 | IA32_X2APIC_ISR6 | IA32_X2APIC_ISR7 => Ok(0),
             IA32_X2APIC_IRR0 | IA32_X2APIC_IRR1 | IA32_X2APIC_IRR2 | IA32_X2APIC_IRR3
-            | IA32_X2APIC_IRR4 | IA32_X2APIC_IRR5 | IA32_X2APIC_IRR6 | IA32_X2APIC_IRR7 => {
-                // info!("irr!");
-                Ok(0)
-            }
-            IA32_X2APIC_LVT_TIMER => Ok(self.virt_lvt_timer_bits as _),
-            _ => hv_result_err!(ENOSYS),
+            | IA32_X2APIC_IRR4 | IA32_X2APIC_IRR5 | IA32_X2APIC_IRR6 | IA32_X2APIC_IRR7 => Ok(0),
+            IA32_X2APIC_ESR => Ok(0),
+            IA32_X2APIC_LVT_TIMER => Ok(self.virt_lvt_timer_bits as u64),
+            IA32_X2APIC_LVT_THERMAL | IA32_X2APIC_LVT_PMI | IA32_X2APIC_LVT_LINT0
+            | IA32_X2APIC_LVT_LINT1 | IA32_X2APIC_LVT_ERROR => Ok(1 << 16), // masked
+            IA32_X2APIC_INIT_COUNT => Ok(0),
+            IA32_X2APIC_CUR_COUNT => Ok(0),
+            IA32_X2APIC_DIV_CONF => Ok(0),
+            IA32_TSC_DEADLINE => Ok(0),
+            _ => Ok(0), // safe default for unknown MSRs
         }
     }
 
     pub fn wrmsr(&mut self, msr: Msr, value: u64) -> HvResult {
         match msr {
             IA32_X2APIC_EOI => {
-                // info!("eoi");
                 pop_vector(this_cpu_id());
                 Ok(())
             }
             IA32_X2APIC_ICR => {
-                // info!("ICR value: {:x}", value);
                 ipi::send_ipi(value);
+                Ok(())
+            }
+            IA32_X2APIC_SIVR => {
+                self.virt_svr = value as u32;
                 Ok(())
             }
             IA32_X2APIC_LVT_TIMER => {
@@ -131,7 +135,11 @@ impl VirtLocalApic {
                 }
                 Ok(())
             }
-            _ => hv_result_err!(ENOSYS),
+            _ => {
+                // Silently ignore writes to other x2APIC MSRs.
+                // The guest thinks the write succeeded.
+                Ok(())
+            }
         }
     }
 }

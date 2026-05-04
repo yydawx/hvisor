@@ -195,32 +195,22 @@ impl MsrBitmap {
         };
 
         bitmap.set_read_intercept(IA32_APIC_BASE, true);
-        bitmap.set_read_intercept(IA32_X2APIC_APICID, true);
-        bitmap.set_read_intercept(IA32_X2APIC_LDR, true);
-        bitmap.set_read_intercept(IA32_X2APIC_LVT_TIMER, true);
-
         bitmap.set_write_intercept(IA32_APIC_BASE, true);
-        bitmap.set_write_intercept(IA32_X2APIC_EOI, true);
-        bitmap.set_write_intercept(IA32_X2APIC_ICR, true);
-        bitmap.set_write_intercept(IA32_X2APIC_LVT_TIMER, true);
+
+        // Intercept ALL x2APIC MSR reads (0x800-0x83F) so we can virtualize
+        // the entire x2APIC register space.  Without this, guest writes to
+        // unintercepted MSRs (e.g. SVR at 0x80F) go straight to the physical
+        // x2APIC and corrupt the host's APIC state.
+        for addr in VirtLocalApic::msr_range() {
+            bitmap.set_intercept_raw(addr, false, true); // read
+            bitmap.set_intercept_raw(addr, true, true);  // write
+        }
 
         // Intercept FS_BASE and GS_BASE MSR access to properly handle them
         bitmap.set_read_intercept(IA32_FS_BASE, true);
         bitmap.set_read_intercept(IA32_GS_BASE, true);
         bitmap.set_write_intercept(IA32_FS_BASE, true);
         bitmap.set_write_intercept(IA32_GS_BASE, true);
-
-        for addr in (IA32_X2APIC_ISR0 as u32)..(IA32_X2APIC_ISR7 as u32 + 1) {
-            if let Ok(msr) = Msr::try_from(addr) {
-                bitmap.set_read_intercept(msr, true);
-            }
-        }
-
-        for addr in (IA32_X2APIC_IRR0 as u32)..(IA32_X2APIC_IRR7 as u32 + 1) {
-            if let Ok(msr) = Msr::try_from(addr) {
-                bitmap.set_read_intercept(msr, true);
-            }
-        }
 
         bitmap
     }
@@ -235,6 +225,11 @@ impl MsrBitmap {
 
     pub fn set_write_intercept(&self, msr: Msr, intercept: bool) {
         self.set_intercept(msr as u32, true, intercept);
+    }
+
+    /// Set intercept for a raw MSR address (useful for MSRs not in the Msr enum).
+    pub fn set_intercept_raw(&self, msr: u32, is_write: bool, intercept: bool) {
+        self.set_intercept(msr, is_write, intercept);
     }
 
     fn set_intercept(&self, msr: u32, is_write: bool, intercept: bool) {

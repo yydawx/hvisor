@@ -18,9 +18,12 @@ use crate::{
     arch::{acpi, boot, msr::set_msr_bitmap, pio, pio::set_pio_bitmap, Stage2PageTable},
     config::*,
     cpu_data::get_cpu_data,
-    device::virtio_trampoline::mmio_virtio_handler,
+    device::{
+        irqchip::pic::ioapic::ioapic_reroute_from_cpus,
+        virtio_trampoline::mmio_virtio_handler,
+    },
     error::HvResult,
-    memory::{GuestPhysAddr, HostPhysAddr, MemFlags, MemoryRegion, MemorySet},
+    memory::{GuestPhysAddr, HostPhysAddr, MemFlags, MemoryRegion, MemorySet, MMIOAccess, mmio_perform_access},
     platform::MEM_TYPE_RESERVED,
     zone::Zone,
 };
@@ -170,6 +173,13 @@ impl Zone {
         set_msr_bitmap(config.zone_id as _);
         set_pio_bitmap(config.zone_id as _);
 
+        // For non-root zones: re-route critical physical interrupts (e.g. UART)
+        // away from CPUs that will run the new zone, so they stay in the root
+        // zone and zone0 doesn't lose interactive console.
+        if zone_id != 0 {
+            ioapic_reroute_from_cpus(&self.cpu_set);
+        }
+
         Ok(())
     }
 
@@ -211,20 +221,57 @@ impl Zone {
         // The MCFG table tells the guest ECAM is at HPA 0xb0000000, which becomes
         // GPA 0xb0000000 when copied into guest ACPI tables. Without this mapping,
         // any PCI config access causes an EPT violation.
-        let ecam_base = 0xb000_0000usize;
-        let ecam_size = 0x20_0000usize;
-        self.gpm.insert(MemoryRegion::new_with_offset_mapper(
-            ecam_base as GuestPhysAddr,
-            ecam_base as HostPhysAddr,
-            ecam_size,
-            MemFlags::READ | MemFlags::WRITE,
-        ));
+        if self.id == 0 {
+            // Zone0: full ECAM identity-map
+            let ecam_base = 0xb000_0000usize;
+            let ecam_size = 0x20_0000usize;
+            self.gpm.insert(MemoryRegion::new_with_offset_mapper(
+                ecam_base as GuestPhysAddr,
+                ecam_base as HostPhysAddr,
+                ecam_size,
+                MemFlags::READ | MemFlags::WRITE,
+            ));
+        } else {
+            // Non-root zone: identity-map ECAM except for the page containing
+            // the virtio-blk device (01:00.0). That page gets an MMIO handler
+            // that returns 0xffffffff for the vendor-ID read, hiding the device
+            // so the guest never tries to access its BAR and corrupt IOMMU state.
+            let ecam_base = 0xb000_0000usize;
+            let virtio_blk_ecam_gpa = ecam_base + 0x10_0000; // bus 1, dev 0, func 0
+            let ecam_page = 0x1000usize;
+
+            // ECAM before virtio-blk page: 0xb0000000..0xb0100000
+            if virtio_blk_ecam_gpa > ecam_base {
+                self.gpm.insert(MemoryRegion::new_with_offset_mapper(
+                    ecam_base as GuestPhysAddr,
+                    ecam_base as HostPhysAddr,
+                    virtio_blk_ecam_gpa - ecam_base,
+                    MemFlags::READ | MemFlags::WRITE,
+                ));
+            }
+            // Virtio-blk ECAM page: MMIO-handler that hides the device
+            self.mmio_region_register(
+                virtio_blk_ecam_gpa,
+                ecam_page,
+                ecam_virtio_blk_hide_handler,
+                virtio_blk_ecam_gpa,
+            );
+            // ECAM after virtio-blk page: 0xb0101000..0xb0200000
+            let after_gpa = virtio_blk_ecam_gpa + ecam_page;
+            let ecam_end = ecam_base + 0x20_0000usize;
+            if after_gpa < ecam_end {
+                self.gpm.insert(MemoryRegion::new_with_offset_mapper(
+                    after_gpa as GuestPhysAddr,
+                    after_gpa as HostPhysAddr,
+                    ecam_end - after_gpa,
+                    MemFlags::READ | MemFlags::WRITE,
+                ));
+            }
+        }
 
         // Map PCI 32-bit MMIO window so the guest can access PCI device BARs.
-        // QEMU Q35 assigns 32-bit PCI MMIO BARs in the 0xC0000000-0xFEBFFFFF range,
-        // up to just below the IOAPIC at 0xFEC00000.
         let pci_mmio_base = 0xC000_0000usize;
-        let pci_mmio_size = 0x3EC0_0000usize;  // ~1004MB, up to IOAPIC
+        let pci_mmio_size = 0x3EB0_0000usize;  // up to 0xFEB00000
         self.gpm.insert(MemoryRegion::new_with_offset_mapper(
             pci_mmio_base as GuestPhysAddr,
             pci_mmio_base as HostPhysAddr,
@@ -232,30 +279,41 @@ impl Zone {
             MemFlags::READ | MemFlags::WRITE,
         ));
 
-        // Map DMA memory region: cover the guest's I/O memory allocator low range
-        // (0x20000000..0xB0000000, i.e. up to ECAM) using HPA 0x1_0000_0000
-        // (4GB, reserved for zone1 by zone0).
-        let dma_gpa_base = 0x2000_0000usize;
-        let dma_hpa_base = 0x1_0000_0000usize;
-        let dma_size = 0x9000_0000usize;  // 2.25GB, up to ECAM at 0xB0000000
+        // Continue PCI MMIO after the virtio MMIO hole
+        let pci_mmio2_base = 0xFEB0_1000usize;
+        let pci_mmio2_size = 0xFF000usize;  // ~1MB, up to IOAPIC at 0xFEC00000
         self.gpm.insert(MemoryRegion::new_with_offset_mapper(
-            dma_gpa_base as GuestPhysAddr,
-            dma_hpa_base as HostPhysAddr,
-            dma_size,
+            pci_mmio2_base as GuestPhysAddr,
+            pci_mmio2_base as HostPhysAddr,
+            pci_mmio2_size,
             MemFlags::READ | MemFlags::WRITE,
         ));
 
-        // Map 64-bit PCI BAR window. QEMU assigns 64-bit BARs (e.g. virtio-blk
-        // modern transport BAR) at high addresses like 0x800000000 (32GB).
-        // Identity-map a window there so the guest can access them.
-        let pci_bar64_base = 0x8_0000_0000usize;   // 32GB
-        let pci_bar64_size = 0x1000_0000usize;    // 256MB
+        // Map 64-bit PCI BAR window for non-root zones (zone0 maps it below too,
+        // but via the RAM regions which cover all of HPA).
+        let pci_bar64_base = 0x8_0000_0000usize;
+        let pci_bar64_size = 0x1000_0000usize;
         self.gpm.insert(MemoryRegion::new_with_offset_mapper(
             pci_bar64_base as GuestPhysAddr,
             pci_bar64_base as HostPhysAddr,
             pci_bar64_size,
             MemFlags::READ | MemFlags::WRITE,
         ));
+
+        // Map DMA memory region for non-root zones: cover the guest's I/O memory
+        // allocator low range (0x20000000..0xB0000000, i.e. up to ECAM) using
+        // HPA 0x1_0000_0000 (4GB, reserved for zone1 by zone0).
+        if self.id != 0 {
+            let dma_gpa_base = 0x2000_0000usize;
+            let dma_hpa_base = 0x1_0000_0000usize;
+            let dma_size = 0x9000_0000usize;  // 2.25GB, up to ECAM at 0xB0000000
+            self.gpm.insert(MemoryRegion::new_with_offset_mapper(
+                dma_gpa_base as GuestPhysAddr,
+                dma_hpa_base as HostPhysAddr,
+                dma_size,
+                MemFlags::READ | MemFlags::WRITE,
+            ));
+        }
 
         Ok(())
     }
@@ -286,3 +344,27 @@ impl Zone {
         }
     }
 }*/
+
+/// ECAM MMIO handler that hides the virtio-blk device (01:00.0) from non-root
+/// zones.  Returns 0xffffffff for the vendor-ID read at offset 0 so the guest
+/// thinks no device is present.  All other accesses are passed through to the
+/// hardware.
+///
+/// Without this filter, a non-root zone discovers zone0's virtio-blk, sets up
+/// DMA through it, and corrupts the IOMMU DMA-remapping state (the IOMMU
+/// context entry points to zone0's EPT, not the non-root zone's).
+fn ecam_virtio_blk_hide_handler(mmio: &mut MMIOAccess, ecam_hpa: usize) -> HvResult {
+    // Offset 0 in the 4 KiB ECAM page: vendor-ID (bits 0..15) + device-ID (bits 16..31)
+    if !mmio.is_write && mmio.address == 0 {
+        // Return invalid vendor-ID so the guest thinks the device doesn't exist
+        mmio.value = 0xffff_ffff;
+        Ok(())
+    } else if mmio.is_write && mmio.address == 0 {
+        // Silently discard writes to vendor-ID (prevent hot-adding the device)
+        Ok(())
+    } else {
+        // Pass through all other config-space accesses to the real hardware
+        mmio_perform_access(ecam_hpa, mmio);
+        Ok(())
+    }
+}

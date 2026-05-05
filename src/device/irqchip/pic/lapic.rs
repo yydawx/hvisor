@@ -29,6 +29,7 @@ use crate::{
 use bit_field::BitField;
 use core::{ops::Range, u32};
 use x2apic::lapic::{LocalApic, LocalApicBuilder, TimerMode};
+use x86::msr::{rdmsr, wrmsr};
 
 pub struct VirtLocalApic {
     pub phys_lapic: LocalApic,
@@ -133,6 +134,18 @@ impl VirtLocalApic {
                         self.phys_lapic.enable_timer();
                     }
                 }
+                Ok(())
+            }
+            IA32_X2APIC_INIT_COUNT => {
+                unsafe { wrmsr(IA32_X2APIC_INIT_COUNT as u32, value) };
+                Ok(())
+            }
+            IA32_X2APIC_DIV_CONF => {
+                unsafe { wrmsr(IA32_X2APIC_DIV_CONF as u32, value) };
+                Ok(())
+            }
+            IA32_TSC_DEADLINE => {
+                unsafe { wrmsr(IA32_TSC_DEADLINE as u32, value) };
                 Ok(())
             }
             _ => {

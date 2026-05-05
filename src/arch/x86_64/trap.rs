@@ -107,8 +107,7 @@ fn handle_irq(vector: u8) {
             ipi::handle_virt_ipi();
         }
         IdtVector::APIC_SPURIOUS_VECTOR
-        | IdtVector::APIC_ERROR_VECTOR
-        | IdtVector::APIC_TIMER_VECTOR => {}
+        | IdtVector::APIC_ERROR_VECTOR => {}
         _ => {
             if vector >= 0x20 && this_cpu_data().arch_cpu.power_on {
                 let cpu_id = this_cpu_id();
@@ -117,7 +116,11 @@ fn handle_irq(vector: u8) {
                 // programmed the LAPIC. They belong to the CURRENT zone,
                 // not zone0. Device interrupts (0x20-0xdf) always belong to
                 // zone0 and must be forwarded if they arrive on a non-zone0 CPU.
-                let is_lapic_local = vector >= 0xe0;
+                // Check if this is a LAPIC-local interrupt.
+                // The guest's timer vector is dynamically allocated and may be < 0xe0,
+                // so we also check against the tracked LAPIC timer vector.
+                let is_lapic_local = vector >= 0xe0
+                    || vector == this_cpu_data().arch_cpu.virt_lapic.virt_timer_vector as u8;
                 if zone_id == 0 || is_lapic_local {
                     inject_vector(cpu_id, vector, None, false);
                 } else {

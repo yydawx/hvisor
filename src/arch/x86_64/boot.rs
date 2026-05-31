@@ -185,7 +185,7 @@ impl BootParams {
         } as HostPhysAddr;
         let boot_params = unsafe { &mut *(boot_params_hpa as *mut BootParams) };
 
-        // info!("boot_proto_version: {:x?}", boot_params.boot_proto_version);
+        info!("boot_proto_version: {:x?}", boot_params.boot_proto_version);
         if boot_params.boot_proto_version < 0x0204 {
             panic!("kernel boot protocol version older than 2.04 not supported!");
         }
@@ -415,7 +415,7 @@ impl BootParams {
         self.screen_info.red_pos = 16;
         self.screen_info.alpha_size = 8;
         self.screen_info.alpha_pos = 24;
-        self.screen_info.orig_video_is_vga = VIDEO_TYPE_EFI;
+        self.screen_info.orig_video_is_vga = VIDEO_TYPE_VLFB;
         self.screen_info.capabilities = 0;
         self.vid_mode = 0xffff;
 

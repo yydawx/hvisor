@@ -79,6 +79,7 @@ impl Zone {
                     ));
                 }
                 MEM_TYPE_VIRTIO => {
+                    info!("Registering virtio mmio region: physical_start: {:#x}, size: {:#x}", mem_region.physical_start, mem_region.size);
                     self.mmio_region_register(
                         mem_region.physical_start as _,
                         mem_region.size as _,

@@ -18,9 +18,7 @@ pub mod ioapic;
 pub mod lapic;
 
 use crate::{
-    arch::{acpi, cpu::this_cpu_id, idt, iommu, ipi, msr, pio, vmcs::Vmcs},
-    consts::{MAX_CPU_NUM, MAX_ZONE_NUM},
-    zone::Zone,
+    arch::{acpi, cpu::this_cpu_id, idt, iommu, ipi, msr, pio, vmcs::Vmcs}, consts::{MAX_CPU_NUM, MAX_ZONE_NUM}, cpu_data::this_zone, zone::Zone
 };
 use alloc::{collections::vec_deque::VecDeque, vec::Vec};
 use core::arch::asm;
@@ -95,6 +93,12 @@ impl PendingVectors {
 }
 
 pub fn inject_vector(cpu_id: usize, vector: u8, err_code: Option<u32>, allow_repeat: bool) {
+    /*let cpu_id = if !this_zone().read().cpu_set.contains_cpu(cpu_id) {
+        info!("inject vector to cpu {:x} in another zone! vector: {:x}", cpu_id, vector);
+        this_cpu_id()
+    } else {
+        cpu_id
+    };*/
     PENDING_VECTORS
         .get()
         .unwrap()

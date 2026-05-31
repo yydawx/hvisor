@@ -16,15 +16,7 @@
 
 use crate::{
     arch::{
-        cpu::{this_cpu_id, ArchCpu},
-        cpuid::{CpuIdEax, ExtendedFeaturesEcx, FeatureInfoFlags},
-        hpet,
-        idt::{IdtStruct, IdtVector},
-        ipi,
-        msr::Msr::{self, *},
-        s2pt::Stage2PageFaultInfo,
-        vmcs::*,
-        vmx::{VmxCrAccessInfo, VmxExitInfo, VmxExitReason, VmxInterruptInfo, VmxIoExitInfo},
+        cpu::{ArchCpu, this_cpu_id}, cpuid::{CpuIdEax, ExtendedFeaturesEcx, FeatureInfoFlags}, hpet, idt::{IdtStruct, IdtVector}, ipi, msr::Msr::{self, *}, pio::I8042_PORT, s2pt::Stage2PageFaultInfo, vmcs::*, vmx::{VmxCrAccessInfo, VmxExitInfo, VmxExitReason, VmxInterruptInfo, VmxIoExitInfo}
     },
     cpu_data::{this_cpu_data, this_zone},
     device::{
@@ -32,11 +24,11 @@ use crate::{
             inject_vector,
             pic::{ioapic::irqs, lapic::VirtLocalApic},
         },
-        uart::{virt_console_io_read, virt_console_io_write, UartReg},
+        uart::{UartReg, virt_console_io_read, virt_console_io_write},
     },
     error::HvResult,
     hypercall::HyperCall,
-    memory::{mmio_handle_access, MMIOAccess, MemFlags},
+    memory::{MMIOAccess, MemFlags, mmio_handle_access},
     zone::this_zone_id,
 };
 use bit_field::BitField;
@@ -106,6 +98,7 @@ fn handle_irq(vector: u8) {
         IdtVector::VIRT_IPI_VECTOR => {
             ipi::handle_virt_ipi();
         }
+        IdtVector::I8042_KEYBOARD_VECTOR => {}
         IdtVector::APIC_SPURIOUS_VECTOR | IdtVector::APIC_ERROR_VECTOR => {}
         _ => {
             if vector >= 0x20 && this_cpu_data().arch_cpu.power_on {
@@ -153,6 +146,12 @@ fn handle_cpuid(arch_cpu: &mut ArchCpu) -> HvResult {
 
                 res
             }
+            CpuIdEax::TscInfo => CpuIdResult {
+                eax: 1, // Numerator for TSC frequency
+                ebx: 1, // Denominator for TSC frequency
+                ecx: hpet::get_tsc_freq_mhz().unwrap_or(0) * 1_000_000, // TSC frequency in Hz
+                edx: 0, // Reserved, typically 0
+            },
             CpuIdEax::ProcessorFrequencyInfo => {
                 if let Some(freq_mhz) = hpet::get_tsc_freq_mhz() {
                     CpuIdResult {
@@ -215,6 +214,9 @@ fn handle_external_interrupt() -> HvResult {
     let int_info = VmxInterruptInfo::new()?;
     trace!("VM-exit: external interrupt: {:#x?}", int_info);
     assert!(int_info.valid);
+    if int_info.vector == 0x21 {
+        // info!("External interrupt: IRQ1 (keyboard)");
+    }
     handle_irq(int_info.vector);
     Ok(())
 }
@@ -275,12 +277,14 @@ fn handle_io_instruction(arch_cpu: &mut ArchCpu, exit_info: &VmxExitInfo) -> HvR
         {
             handle_pci_config_port_write(&io_info, value);
         } else if UART_COM1_PORT.contains(&io_info.port) {
-            virt_console_io_write(io_info.port, value);
-        } else {
-            /* info!(
-                "unhandled port io write {:x} value: {:x}",
-                io_info.port, value
-            ); */
+            if this_zone_id() == 0 {
+                virt_console_io_write(io_info.port, value);
+            } else {
+                virt_console_io_write(io_info.port, value);
+                // info!("zone1 uart write from {:x}: {:x}", io_info.port, value);
+            }
+        } else if I8042_PORT.contains(&io_info.port) {
+            // info!("unhandled port io write {:x} value: {:x}", io_info.port, value);
         }
     } else {
         if PCI_CONFIG_ADDR_PORT.contains(&io_info.port)
@@ -288,8 +292,17 @@ fn handle_io_instruction(arch_cpu: &mut ArchCpu, exit_info: &VmxExitInfo) -> HvR
         {
             value = handle_pci_config_port_read(&io_info);
         } else if UART_COM1_PORT.contains(&io_info.port) {
-            value = virt_console_io_read(io_info.port);
-        } else {
+            if this_zone_id() == 0 {
+                value = virt_console_io_read(io_info.port);
+            } else {
+                value = 0xff;
+                value = virt_console_io_read(io_info.port);
+                // info!("zone1 uart read from {:x}: {:x}", io_info.port, value);         
+            }
+        } else if I8042_PORT.contains(&io_info.port) {
+            value = 0xff;
+        }
+        else {
             // info!("unhandled port io read {:x}", io_info.port);
             value = 0x0;
         }

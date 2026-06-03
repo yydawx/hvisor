@@ -11,7 +11,7 @@ QEMU_ARGS := -machine q35,kernel-irqchip=split
 QEMU_ARGS += -cpu host,+x2apic,+invtsc,+vmx -accel kvm
 QEMU_ARGS += -smp 4
 QEMU_ARGS += -serial mon:stdio
-QEMU_ARGS += -m 4G
+QEMU_ARGS += -m 12G
 QEMU_ARGS += -bios /usr/share/ovmf/OVMF.fd
 QEMU_ARGS += -vga std
 # QEMU_ARGS += -nographic

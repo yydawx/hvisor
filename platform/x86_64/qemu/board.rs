@@ -104,8 +104,8 @@ pub const ROOT_ZONE_MEMORY_REGIONS: [HvConfigMemoryRegion; 10] = [
         mem_type: MEM_TYPE_RESERVED,
         physical_start: 0x1_0000_0000,
         virtual_start: 0x1_0000_0000,
-        size: 0x7000_0000,
-    }, // zone 1
+        size: 0x1_E000_0000,
+    }, // zone 1 (0x100000000 → 0x2E0000000)
 ];
 
 const ROOT_ZONE_CMDLINE_ADDR: GuestPhysAddr = 0x9000;

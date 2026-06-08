@@ -184,6 +184,8 @@ pub struct ArchCpu {
     vmxon_region: VmxRegion,
     vmcs_region: VmxRegion,
     vm_launch_guest_regs: GeneralRegisters,
+    /// Multiboot2 mode: CPU starts in 32-bit protected mode
+    pub multiboot_mode: bool,
 }
 
 impl ArchCpu {
@@ -200,6 +202,7 @@ impl ArchCpu {
             vmxon_region: VmxRegion::fake_init(),
             vmcs_region: VmxRegion::fake_init(),
             vm_launch_guest_regs: GeneralRegisters::default(),
+            multiboot_mode: false,
         }
     }
 
@@ -297,8 +300,16 @@ impl ArchCpu {
 
         if per_cpu.boot_cpu {
             // must be called after activate_gpm()
-            iommu::activate();
+            // Only zone0 has PCI devices that need IOMMU DMA translation.
+            // Zone1 has no PCI devices, and calling activate() a second
+            // time might subtly corrupt QEMU VT-d cached state.
+            if this_zone_id() == 0 {
+                iommu::activate();
+            }
             self.guest_regs = self.vm_launch_guest_regs.clone();
+            info!("[BOOT] CPU {} boot_cpu=true, copying vm_launch_guest_regs to guest_regs", self.cpuid);
+            info!("[BOOT] guest_regs: RAX={:#x}, RBX={:#x}, RSI={:#x}",
+                  self.guest_regs.rax, self.guest_regs.rbx, self.guest_regs.rsi);
         }
 
         while VMXON_DONE.load(Ordering::Acquire) < unsafe { consts::MAX_CPU_NUM } as u32 - 1 {
@@ -317,6 +328,16 @@ impl ArchCpu {
     pub fn set_boot_cpu_vm_launch_regs(&mut self, rax: u64, rsi: u64) {
         self.vm_launch_guest_regs.rax = rax;
         self.vm_launch_guest_regs.rsi = rsi;
+    }
+
+    /// Set Multiboot2 boot registers (EAX=multiboot magic, EBX=multiboot info pointer)
+    pub fn set_multiboot_boot_regs(&mut self, multiboot_info_addr: u64) {
+        self.vm_launch_guest_regs.rax = 0x36D76289;  // Multiboot2 magic
+        self.vm_launch_guest_regs.rbx = multiboot_info_addr;
+    }
+
+    pub fn set_multiboot_mode(&mut self, enabled: bool) {
+        self.multiboot_mode = enabled;
     }
 
     fn activate_vmx(&mut self) -> HvResult {
@@ -383,9 +404,11 @@ impl ArchCpu {
         Vmcs::clear(start_paddr)?;
         Vmcs::load(start_paddr)?;
 
+        // Setup VMCS control fields first (includes secondary controls like UNRESTRICTED_GUEST)
+        // This must be done before setup_vmcs_guest so that guest state is properly initialized
+        self.setup_vmcs_control()?;
         self.setup_vmcs_host(&self.host_stack_top as *const _ as usize)?;
         self.setup_vmcs_guest(entry, ROOT_ZONE_BOOT_STACK)?;
-        self.setup_vmcs_control()?;
 
         Ok(())
     }
@@ -419,18 +442,36 @@ impl ArchCpu {
 
         // enable EPT, RDTSCP, INVPCID, and unrestricted guest
         use SecondaryControls as CpuCtrl2;
-        Vmcs::set_control(
+
+        // Debug: print secondary controls capability
+        let sec_ctl_cap = Msr::IA32_VMX_PROCBASED_CTLS2.read();
+        let sec_ctl_allowed0 = sec_ctl_cap as u32;
+        let sec_ctl_allowed1 = (sec_ctl_cap >> 32) as u32;
+        debug!("[VMX] Secondary controls capability: allowed0={:#x}, allowed1={:#x}", sec_ctl_allowed0, sec_ctl_allowed1);
+        debug!("[VMX] UNRESTRICTED_GUEST bit in allowed1: {}", (sec_ctl_allowed1 >> 7) & 1);
+
+        let desired_sec_ctl = (CpuCtrl2::ENABLE_EPT
+            | CpuCtrl2::ENABLE_RDTSCP
+            | CpuCtrl2::ENABLE_INVPCID
+            | CpuCtrl2::UNRESTRICTED_GUEST)
+            .bits();
+        debug!("[VMX] Desired secondary controls: {:#x}", desired_sec_ctl);
+
+        match Vmcs::set_control(
             VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS,
             Msr::IA32_VMX_PROCBASED_CTLS2,
             0,
-            (CpuCtrl2::ENABLE_EPT
-                | CpuCtrl2::ENABLE_RDTSCP
-                // | CpuCtrl2::VIRTUALIZE_X2APIC
-                | CpuCtrl2::ENABLE_INVPCID
-                | CpuCtrl2::UNRESTRICTED_GUEST)
-                .bits(),
+            desired_sec_ctl,
             0,
-        )?;
+        ) {
+            Ok(_) => {
+                let actual = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read().unwrap_or(0);
+                debug!("[VMX] Secondary controls set successfully, actual={:#x}", actual);
+            }
+            Err(e) => {
+                error!("[VMX] Failed to set secondary controls: {:?}", e);
+            }
+        }
 
         // load guest IA32_PAT/IA32_EFER on VM entry
         use EntryControls as EntryCtrl;
@@ -463,8 +504,21 @@ impl ArchCpu {
         VmcsControl32::VMEXIT_MSR_LOAD_COUNT.write(0)?;
         VmcsControl32::VMENTRY_MSR_LOAD_COUNT.write(0)?;
 
-        // pass-through exceptions, set I/O bitmap and MSR bitmaps
-        VmcsControl32::EXCEPTION_BITMAP.write(0)?;
+        // Clear VM-entry interruption info (no interrupt/exception to inject on VM entry)
+        // This is only needed for fresh VM launch, but writing 0 is harmless
+        VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD.write(0)?;
+
+        // For Multiboot2 mode, intercept all exceptions since we don't have a valid IDT
+        // Exception bitmap: each bit corresponds to an exception vector (0-31)
+        // For normal guests, pass-through exceptions (bitmap = 0)
+        // For Multiboot2 guests, intercept exceptions to prevent triple faults
+        if self.multiboot_mode {
+            // Intercept all exceptions (vectors 0-31)
+            // Bits 0-31 set = intercept DE, DB, NMI, BP, OF, BR, UD, NM, DF, TS, NP, SS, GP, PF, MF, AC, MC, XM, VE
+            VmcsControl32::EXCEPTION_BITMAP.write(0xFFFFFFFF)?;
+        } else {
+            VmcsControl32::EXCEPTION_BITMAP.write(0)?;
+        }
 
         if self.power_on {
             let pio_bitmap = get_pio_bitmap(this_zone_id());
@@ -481,66 +535,288 @@ impl ArchCpu {
     }
 
     fn setup_vmcs_guest(&mut self, entry: GuestPhysAddr, rsp: GuestPhysAddr) -> HvResult {
-        let cr0_guest = Cr0Flags::EXTENSION_TYPE | Cr0Flags::NUMERIC_ERROR;
-        let cr4_guest = Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS;
+        // Check if this is Multiboot2 mode (booting a Multiboot2-compatible kernel)
+        debug!("[VMCS] setup_vmcs_guest: multiboot_mode={}, entry={:#x}, rsp={:#x}",
+              self.multiboot_mode, entry, rsp);
+        if self.multiboot_mode {
+            self.setup_multiboot_guest_state(entry)?;
 
-        self.set_cr(0, cr0_guest.bits());
-        self.set_cr(3, 0);
-        self.set_cr(4, cr4_guest.bits());
+        } else {
+            // Original real mode / unrestricted guest setup
+            let cr0_guest = Cr0Flags::EXTENSION_TYPE | Cr0Flags::NUMERIC_ERROR;
+            let cr4_guest = Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS;
 
-        macro_rules! set_guest_segment {
-            ($seg: ident, $access_rights: expr) => {{
-                use VmcsGuest16::*;
-                use VmcsGuest32::*;
-                use VmcsGuestNW::*;
-                concat_idents!($seg, _SELECTOR).write(0)?;
-                concat_idents!($seg, _BASE).write(0)?;
-                concat_idents!($seg, _LIMIT).write(0xffff)?;
-                concat_idents!($seg, _ACCESS_RIGHTS).write($access_rights)?;
-            }};
-        }
+            self.set_cr(0, cr0_guest.bits());
+            self.set_cr(3, 0);
+            self.set_cr(4, cr4_guest.bits());
 
-        set_guest_segment!(ES, 0x93); // 16-bit, present, data, read/write, accessed
-        set_guest_segment!(CS, 0x9b); // 16-bit, present, code, exec/read, accessed
-        set_guest_segment!(SS, 0x93);
-        set_guest_segment!(DS, 0x93);
-        set_guest_segment!(FS, 0x93);
-        set_guest_segment!(GS, 0x93);
-        set_guest_segment!(TR, 0x8b); // present, system, 32-bit TSS busy
-        set_guest_segment!(LDTR, 0x82); // present, system, LDT
+            macro_rules! set_guest_segment {
+                ($seg: ident, $access_rights: expr) => {{
+                    use VmcsGuest16::*;
+                    use VmcsGuest32::*;
+                    use VmcsGuestNW::*;
+                    concat_idents!($seg, _SELECTOR).write(0)?;
+                    concat_idents!($seg, _BASE).write(0)?;
+                    concat_idents!($seg, _LIMIT).write(0xffff)?;
+                    concat_idents!($seg, _ACCESS_RIGHTS).write($access_rights)?;
+                }};
+            }
 
-        VmcsGuestNW::GDTR_BASE.write(0)?;
-        VmcsGuest32::GDTR_LIMIT.write(0xffff)?;
-        VmcsGuestNW::IDTR_BASE.write(0)?;
-        VmcsGuest32::IDTR_LIMIT.write(0xffff)?;
+            set_guest_segment!(ES, 0x93);
+            set_guest_segment!(CS, 0x9b);
+            set_guest_segment!(SS, 0x93);
+            set_guest_segment!(DS, 0x93);
+            set_guest_segment!(FS, 0x93);
+            set_guest_segment!(GS, 0x93);
+            set_guest_segment!(TR, 0x8b);
+            set_guest_segment!(LDTR, 0x82);
 
-        VmcsGuestNW::DR7.write(0x400)?;
-        VmcsGuestNW::RSP.write(rsp)?;
-        VmcsGuestNW::RIP.write(entry)?;
-        VmcsGuestNW::RFLAGS.write(0x2)?;
-        VmcsGuestNW::PENDING_DBG_EXCEPTIONS.write(0)?;
-        VmcsGuestNW::IA32_SYSENTER_ESP.write(0)?;
-        VmcsGuestNW::IA32_SYSENTER_EIP.write(0)?;
-        VmcsGuest32::IA32_SYSENTER_CS.write(0)?;
+            VmcsGuestNW::GDTR_BASE.write(0)?;
+            VmcsGuest32::GDTR_LIMIT.write(0xffff)?;
+            VmcsGuestNW::IDTR_BASE.write(0)?;
+            VmcsGuest32::IDTR_LIMIT.write(0xffff)?;
 
-        VmcsGuest32::INTERRUPTIBILITY_STATE.write(0)?;
-        VmcsGuest32::ACTIVITY_STATE.write(0)?;
-        VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(0)?;
+            VmcsGuestNW::DR7.write(0x400)?;
+            VmcsGuestNW::RSP.write(rsp)?;
+            VmcsGuestNW::RIP.write(entry)?;
+            VmcsGuestNW::RFLAGS.write(0x2)?;
+            VmcsGuestNW::PENDING_DBG_EXCEPTIONS.write(0)?;
+            VmcsGuestNW::IA32_SYSENTER_ESP.write(0)?;
+            VmcsGuestNW::IA32_SYSENTER_EIP.write(0)?;
+            VmcsGuest32::IA32_SYSENTER_CS.write(0)?;
 
-        VmcsGuest64::LINK_PTR.write(u64::MAX)?; // SDM Vol. 3C, Section 24.4.2
-        VmcsGuest64::IA32_DEBUGCTL.write(0)?;
-        VmcsGuest64::IA32_PAT.write(Msr::IA32_PAT.read())?;
-        VmcsGuest64::IA32_EFER.write(0)?;
+            VmcsGuest32::INTERRUPTIBILITY_STATE.write(0)?;
+            VmcsGuest32::ACTIVITY_STATE.write(0)?;
+            VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(0)?;
 
-        // for AP start up, set CS_BASE to entry address, and RIP to 0.
-        if self.power_on && !this_cpu_data().boot_cpu {
-            VmcsGuestNW::RIP.write(0)?;
-            VmcsGuestNW::CS_BASE.write(entry)?;
+            VmcsGuest64::LINK_PTR.write(u64::MAX)?;
+            VmcsGuest64::IA32_DEBUGCTL.write(0)?;
+            VmcsGuest64::IA32_PAT.write(Msr::IA32_PAT.read())?;
+            VmcsGuest64::IA32_EFER.write(0)?;
+
+            // for AP start up, set CS_BASE to entry address, and RIP to 0.
+            if self.power_on && !this_cpu_data().boot_cpu {
+                VmcsGuestNW::RIP.write(0)?;
+                VmcsGuestNW::CS_BASE.write(entry)?;
+            }
         }
 
         Ok(())
     }
 
+
+    /// Set up guest state for Multiboot2 32-bit protected mode entry.
+    /// The kernel transitions itself to 64-bit long mode.
+    fn setup_multiboot_guest_state(&mut self, entry: GuestPhysAddr) -> HvResult {
+            // ===== CR0 Setup (MULTIBOOT) =====
+            // Reference: QEMU's macvm_set_cr0 in vmx.h
+            // For 32-bit protected mode with unrestricted guest: PE=1, PG=0
+            // CR0 fixed bits: IA32_VMX_CR0_FIXED0 (must be 1), IA32_VMX_CR0_FIXED1 (must be 0)
+            let cr0_fixed0 = Msr::IA32_VMX_CR0_FIXED0.read();
+            let cr0_fixed1 = Msr::IA32_VMX_CR0_FIXED1.read();
+
+            // Build CR0 value: PE=1, PG=0, other fixed bits as required
+            // Start with PE=1 for protected mode
+            let mut cr0_guest = Cr0Flags::PROTECTED_MODE_ENABLE.bits();
+
+            // Apply fixed bits: must be 1 bits (excluding PE and PG for unrestricted guest)
+            // and must be 0 bits
+            let cr0_fixed1_excluding_pe_pg = cr0_fixed1 | Cr0Flags::PAGING.bits() | Cr0Flags::PROTECTED_MODE_ENABLE.bits();
+            let cr0_fixed0_excluding_pe_pg = cr0_fixed0 & !(Cr0Flags::PAGING.bits() | Cr0Flags::PROTECTED_MODE_ENABLE.bits());
+            cr0_guest = (cr0_guest | cr0_fixed0_excluding_pe_pg) & cr0_fixed1_excluding_pe_pg;
+
+            // ===== CR4 Setup =====
+            let cr4_fixed0 = Msr::IA32_VMX_CR4_FIXED0.read();
+            let cr4_fixed1 = Msr::IA32_VMX_CR4_FIXED1.read();
+
+            // Build CR4 value with fixed bits
+            let cr4_guest = (cr4_fixed0 & cr4_fixed1) as usize;  // Apply both must-be-1 and must-be-0
+
+            // Debug output
+            debug!("[MULTIBOOT] Setting up 32-bit protected mode (kernel transitions to 64-bit)");
+            debug!("[MULTIBOOT] CR0_FIXED0={:#x}, CR0_FIXED1={:#x}", cr0_fixed0, cr0_fixed1);
+            debug!("[MULTIBOOT] CR4_FIXED0={:#x}, CR4_FIXED1={:#x}", cr4_fixed0, cr4_fixed1);
+            debug!("[MULTIBOOT] Final CR0={:#x}, CR4={:#x}", cr0_guest, cr4_guest);
+
+            // Write CR0 with proper handling
+            // Reference: QEMU's macvm_set_cr0 - only intercept CD, NW, NE, ET bits
+            // Do NOT intercept PG - guest needs to enable paging to switch to long mode
+            VmcsGuestNW::CR0.write(cr0_guest as usize)?;
+            VmcsControlNW::CR0_READ_SHADOW.write(cr0_guest as usize)?;
+            // CR0 mask: intercept CD, NW, NE, ET (not PG, not PE)
+            // This allows guest to freely enable/disable paging and protected mode
+            let cr0_mask = Cr0Flags::CACHE_DISABLE.bits()
+                | Cr0Flags::NOT_WRITE_THROUGH.bits()
+                | Cr0Flags::NUMERIC_ERROR.bits()
+                | Cr0Flags::EXTENSION_TYPE.bits();  // ET bit
+            VmcsControlNW::CR0_GUEST_HOST_MASK.write(cr0_mask as usize)?;
+
+            // Write CR3 - use the guest's page tables (EPT will translate to host physical)
+            // For now, set to 0 - the guest will set up its own page tables
+            // Or we could create identity-mapped tables
+            VmcsGuestNW::CR3.write(0)?;
+
+            // Write CR4 with proper handling
+            // Reference: QEMU's macvm_set_cr4 - only intercept VMXE bit
+            VmcsGuestNW::CR4.write(cr4_guest)?;
+            VmcsControlNW::CR4_READ_SHADOW.write(cr4_guest)?;
+            // CR4 mask: only intercept VMXE bit (guest cannot modify VMXE)
+            VmcsControlNW::CR4_GUEST_HOST_MASK.write(Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits() as usize)?;
+
+            // ===== Segment Setup for 32-bit Protected Mode =====
+            // Use kernel's GDT at GPA 0x80014f0 with:
+            // - Selector 0x08: 64-bit code segment (for later transition)
+            // - Selector 0x10: Data segment
+            // - Selector 0x18: 32-bit code segment
+            //
+            // We use selector 0x18 for CS (32-bit code) and 0x10 for data.
+            // The kernel will later reload its own GDT and transition to 64-bit.
+            //
+            // IMPORTANT: Write order follows QEMU's vmx_write_segment_descriptor:
+            // base -> limit -> selector -> ar_bytes
+
+            // CS: 32-bit code segment at selector 0x18
+            // VMCS AR format (Intel SDM Vol 3D, Appendix B):
+            // bit 15: G (granularity)
+            // bit 14: D/B (default operation size) - 1=32-bit, 0=16-bit
+            // bit 13: L (long mode) - 1=64-bit code
+            // bit 12: AVL (available)
+            // bit 7: P (present)
+            // bits 5-6: DPL
+            // bit 4: S (system) - 1=code/data, 0=system
+            // bits 0-3: Type
+            //
+            // For 32-bit code: G=1, D=1, L=0, P=1, DPL=0, S=1, Type=0xB
+            // = 0b 1_1_0_0_0000_1_00_1_1011 = 0xC09B
+            VmcsGuestNW::CS_BASE.write(0)?;
+            VmcsGuest32::CS_LIMIT.write(0xFFFFFFFF)?;
+            VmcsGuest16::CS_SELECTOR.write(0x18)?;
+            VmcsGuest32::CS_ACCESS_RIGHTS.write(0xC09B)?;  // 32-bit code: G=1, D=1, L=0, P=1
+
+            // Verify CS was written correctly
+            let cs_ar_written = VmcsGuest32::CS_ACCESS_RIGHTS.read()?;
+            let cs_sel = VmcsGuest16::CS_SELECTOR.read()?;
+            let cs_base = VmcsGuestNW::CS_BASE.read()?;
+            let cs_limit = VmcsGuest32::CS_LIMIT.read()?;
+            debug!("[MULTIBOOT] CS state: sel={:#x}, base={:#x}, limit={:#x}, ar={:#x}",
+                  cs_sel, cs_base, cs_limit, cs_ar_written);
+
+            // Check if AR D bit (bit 14) and L bit (bit 13) are correct
+            // For 32-bit code: D=1, L=0
+            let d_bit = (cs_ar_written >> 14) & 1;
+            let l_bit = (cs_ar_written >> 13) & 1;
+            debug!("[MULTIBOOT] CS AR: D={}, L={} (should be D=1, L=0 for 32-bit code)", d_bit, l_bit);
+
+            if cs_ar_written != 0xC09B {
+                warn!("[MULTIBOOT] CS AR mismatch! Expected {:#x}, got {:#x}", 0xC09B, cs_ar_written);
+            }
+
+            // DS: Data segment at selector 0x10
+            // VMCS AR for data: G=1, B=1 (32-bit), L=0, P=1, DPL=0, S=1, Type=0x3
+            // = 0b 1_1_0_0_0000_1_00_1_0011 = 0xC093
+            VmcsGuestNW::DS_BASE.write(0)?;
+            VmcsGuest32::DS_LIMIT.write(0xFFFFFFFF)?;
+            VmcsGuest16::DS_SELECTOR.write(0x10)?;
+            VmcsGuest32::DS_ACCESS_RIGHTS.write(0xC093)?;
+
+            // ES: Data segment at selector 0x10
+            VmcsGuestNW::ES_BASE.write(0)?;
+            VmcsGuest32::ES_LIMIT.write(0xFFFFFFFF)?;
+            VmcsGuest16::ES_SELECTOR.write(0x10)?;
+            VmcsGuest32::ES_ACCESS_RIGHTS.write(0xC093)?;
+
+            // SS: Data segment at selector 0x10 (B=1 for 32-bit stack operations)
+            // CRITICAL: B=1 (bit 14) is required for 32-bit stack operations (PUSH/POP use ESP, not SP)
+            VmcsGuestNW::SS_BASE.write(0)?;
+            VmcsGuest32::SS_LIMIT.write(0xFFFFFFFF)?;
+            VmcsGuest16::SS_SELECTOR.write(0x10)?;
+            VmcsGuest32::SS_ACCESS_RIGHTS.write(0xC093)?;
+
+            // Verify SS was written correctly (B=1 for 32-bit stack)
+            let ss_ar_written = VmcsGuest32::SS_ACCESS_RIGHTS.read()?;
+            let ss_sel = VmcsGuest16::SS_SELECTOR.read()?;
+            let ss_b_bit = (ss_ar_written >> 14) & 1;
+            debug!("[MULTIBOOT] SS state: sel={:#x}, ar={:#x} (B bit={} for {}-bit stack)",
+                  ss_sel, ss_ar_written, ss_b_bit, if ss_b_bit == 1 { "32" } else { "16" });
+
+            // FS: Unusable (selector=0, ar=0x10000 with bit 16 set)
+            VmcsGuestNW::FS_BASE.write(0)?;
+            VmcsGuest32::FS_LIMIT.write(0)?;
+            VmcsGuest16::FS_SELECTOR.write(0)?;
+            VmcsGuest32::FS_ACCESS_RIGHTS.write(0x10000)?;
+
+            // GS: Unusable
+            VmcsGuestNW::GS_BASE.write(0)?;
+            VmcsGuest32::GS_LIMIT.write(0)?;
+            VmcsGuest16::GS_SELECTOR.write(0)?;
+            VmcsGuest32::GS_ACCESS_RIGHTS.write(0x10000)?;
+
+            // TR: TSS segment
+            // For VMX, TR must be valid (not unusable). We need a minimal TSS.
+            // Use a safe location below the stack (stack is at 0x804a000)
+            // TSS at GPA 0x8048000 is safe (in stack area but below actual stack usage)
+            // Note: 0x8009000 is kernel boot code - DO NOT USE!
+            // VMCS AR for 32-bit busy TSS: Type=0xB, P=1
+            VmcsGuestNW::TR_BASE.write(0x8048000)?;
+            VmcsGuest32::TR_LIMIT.write(0x67)?;  // 32-bit TSS size - 1
+            VmcsGuest16::TR_SELECTOR.write(0x20)?;
+            VmcsGuest32::TR_ACCESS_RIGHTS.write(0x008B)?;  // 32-bit busy TSS
+
+            // LDTR: Unusable
+            VmcsGuestNW::LDTR_BASE.write(0)?;
+            VmcsGuest32::LDTR_LIMIT.write(0)?;
+            VmcsGuest16::LDTR_SELECTOR.write(0)?;
+            VmcsGuest32::LDTR_ACCESS_RIGHTS.write(0x10000)?;
+
+            // GDTR: Use kernel's GDT at GPA 0x80014f0
+            // We extended it to include TSS at entry 4 (selector 0x20)
+            VmcsGuestNW::GDTR_BASE.write(0x80014f0)?;
+            VmcsGuest32::GDTR_LIMIT.write(0x2F)?;  // 6 entries
+
+            // IDTR - set to null/zero for now (guest will set up its own IDT)
+            VmcsGuestNW::IDTR_BASE.write(0)?;
+            VmcsGuest32::IDTR_LIMIT.write(0)?;
+
+            // Other registers
+            VmcsGuestNW::DR7.write(0x400)?;
+            let multiboot_rsp: usize = 0x804a000;
+            VmcsGuestNW::RSP.write(multiboot_rsp)?;
+            VmcsGuestNW::RIP.write(entry)?;
+            VmcsGuestNW::RFLAGS.write(0x2)?;
+            VmcsGuestNW::PENDING_DBG_EXCEPTIONS.write(0)?;
+            VmcsGuestNW::IA32_SYSENTER_ESP.write(0)?;
+            VmcsGuestNW::IA32_SYSENTER_EIP.write(0)?;
+            VmcsGuest32::IA32_SYSENTER_CS.write(0)?;
+
+            VmcsGuest32::INTERRUPTIBILITY_STATE.write(0)?;
+            VmcsGuest32::ACTIVITY_STATE.write(0)?;
+            VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(0)?;
+
+            VmcsGuest64::LINK_PTR.write(u64::MAX)?;
+            VmcsGuest64::IA32_DEBUGCTL.write(0)?;
+            VmcsGuest64::IA32_PAT.write(Msr::IA32_PAT.read())?;
+            VmcsGuest64::IA32_EFER.write(0)?;  // No long mode - kernel will enable it
+
+            // Debug: print VMCS entry controls
+            let entry_ctls = VmcsControl32::VMENTRY_CONTROLS.read().unwrap_or(0);
+            let proc_ctls = VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read().unwrap_or(0);
+            let proc_ctls2 = VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read().unwrap_or(0);
+            let intr_info = VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD.read().unwrap_or(0);
+            debug!("[MULTIBOOT] VM-entry controls: {:#x}, IA32E_MODE_GUEST bit={}",
+                  entry_ctls, (entry_ctls >> 9) & 1);
+            debug!("[MULTIBOOT] Primary exec controls: {:#x}", proc_ctls);
+            debug!("[MULTIBOOT] Secondary exec controls: {:#x} (UNRESTRICTED_GUEST={})",
+                  proc_ctls2, (proc_ctls2 >> 7) & 1);
+            debug!("[MULTIBOOT] VM-entry interruption info: {:#x}", intr_info);
+
+            debug!("[MULTIBOOT] 32-bit protected mode guest setup: CR0={:#x}, CR4={:#x}, RIP={:#x}",
+                  cr0_guest, cr4_guest, entry);
+            debug!("[MULTIBOOT] Using kernel GDT at 0x80014f0, CS=0x18, DS=SS=0x10");
+            debug!("[MULTIBOOT] Guest registers: RAX={:#x}, RBX={:#x} (multiboot_info)",
+                  self.vm_launch_guest_regs.rax, self.vm_launch_guest_regs.rbx);
+
+            Ok(())
+    }
     fn setup_vmcs_host(&mut self, rsp: GuestPhysAddr) -> HvResult {
         VmcsHost64::IA32_PAT.write(Msr::IA32_PAT.read())?;
         VmcsHost64::IA32_EFER.write(Msr::IA32_EFER.read())?;

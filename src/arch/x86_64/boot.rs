@@ -174,10 +174,12 @@ pub struct BootParams {
 
 impl BootParams {
     pub fn fill(config: &HvZoneConfig, gpm: &mut MemorySet<Stage2PageTable>) -> HvResult {
-        if config.arch_config.setup_load_gpa == 0 {
+        if config.arch_config.setup_load_gpa == 0 && config.arch_config.multiboot_enabled == 0 {
             panic!("setup addr not set yet!");
         }
-
+        if config.arch_config.multiboot_enabled != 0 {
+            return Ok(());
+        }
         let boot_params_hpa = unsafe {
             gpm.page_table_query(config.arch_config.setup_load_gpa)
                 .unwrap()

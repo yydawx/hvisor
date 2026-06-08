@@ -26,6 +26,16 @@ use crate::{
 };
 use alloc::vec::Vec;
 
+// --- Constants for Multiboot2 TSS setup ---
+/// GPA where the 32-bit TSS is placed (below the kernel stack at 0x804a000).
+pub const MB2_TSS_GPA: usize = 0x8048_0000;
+/// Size of a 32-bit TSS in bytes.
+pub const MB2_TSS_SIZE: usize = 104;
+/// GPA of the kernel's built-in GDT.
+pub const MB2_GDT_BASE_GPA: usize = 0x8001_4f0;
+/// GDT entry index reserved for the TSS descriptor.
+pub const MB2_GDT_TSS_ENTRY: usize = 4;
+
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct HvArchZoneConfig {
@@ -60,6 +70,8 @@ pub struct HvArchZoneConfig {
     /// No need to add a memory region for the framebuffer,
     /// Hvisor will do the job. **IMPORTANT: screen_base should be no longer than 32 bits.**
     pub screen_base: usize,
+    pub multiboot_info_paddr: u64,
+    pub multiboot_enabled: u32,
 }
 
 impl Zone {
@@ -76,10 +88,9 @@ impl Zone {
                         mem_region.physical_start as HostPhysAddr,
                         mem_region.size as _,
                         flags,
-                    ));
+                    ))?;
                 }
                 MEM_TYPE_VIRTIO => {
-                    info!("Registering virtio mmio region: physical_start: {:#x}, size: {:#x}", mem_region.physical_start, mem_region.size);
                     self.mmio_region_register(
                         mem_region.physical_start as _,
                         mem_region.size as _,
@@ -101,21 +112,98 @@ impl Zone {
 
     /// called after cpu_set is initialized
     pub fn arch_zone_pre_configuration(&mut self, config: &HvZoneConfig) -> HvResult {
-        self.cpu_set.iter().for_each(|cpuid| {
-            let cpu_data = get_cpu_data(cpuid);
-            // boot cpu
-            if cpuid == self.cpu_set.first_cpu().unwrap() {
-                cpu_data.arch_cpu.set_boot_cpu_vm_launch_regs(
-                    config.arch_config.kernel_entry_gpa as _,
-                    config.arch_config.setup_load_gpa as _,
-                );
-            }
-        });
+        let zone_id = config.zone_id as usize;
+
+        // Check if this is zone1 (Multiboot2) or zone0 (Linux)
+        if zone_id != 0 && config.arch_config.multiboot_enabled != 0 {
+            // Zone1 with Multiboot2 - use Multiboot2 boot mode
+            info!("[ZONE{}] Using Multiboot2 boot mode", zone_id);
+            info!("[ZONE{}] multiboot_enabled={}, config.arch_config.multiboot_info_paddr={:#x}",
+                  zone_id, config.arch_config.multiboot_enabled, config.arch_config.multiboot_info_paddr);
+
+            self.setup_multiboot_tss(zone_id);
+            self.setup_multiboot_boot_regs(config, zone_id);
+
+            self.cpu_set.iter().for_each(|cpuid| {
+                let cpu_data = get_cpu_data(cpuid);
+                if cpuid == self.cpu_set.first_cpu().unwrap() {
+                    cpu_data.arch_cpu.set_multiboot_mode(true);
+                    cpu_data.arch_cpu.set_multiboot_boot_regs(
+                        config.arch_config.multiboot_info_paddr as _,
+                    );
+                    info!("[ZONE{}] Multiboot2: EAX=0x36D76289, EBX=0x{:x}",
+                        zone_id, config.arch_config.multiboot_info_paddr);
+                }
+            });
+        } else {
+            self.cpu_set.iter().for_each(|cpuid| {
+                let cpu_data = get_cpu_data(cpuid);
+                if cpuid == self.cpu_set.first_cpu().unwrap() {
+                    cpu_data.arch_cpu.set_multiboot_mode(false);
+                    cpu_data.arch_cpu.set_boot_cpu_vm_launch_regs(
+                        config.arch_config.kernel_entry_gpa as _,
+                        config.arch_config.setup_load_gpa as _,
+                    );
+                }
+            });
+        }
 
         set_msr_bitmap(config.zone_id as _);
         set_pio_bitmap(config.zone_id as _);
 
         Ok(())
+    }
+
+    /// Build a 32-bit available TSS descriptor from base and limit.
+    fn make_tss_descriptor(base: usize, limit: u64) -> u64 {
+        // Type 0x89 = Present | 32-bit available TSS, DPL=0.
+        // Layout: limit[15:0] | base[23:0] << 16 | type[7:0] << 40 | limit[19:16] << 48 | base[31:24] << 56
+        (limit & 0xffff)
+            | ((base as u64 & 0xffffff) << 16)
+            | (0x89u64 << 40)
+            | (((limit >> 16) & 0xf) << 48)
+            | (((base as u64 >> 24) & 0xff) << 56)
+    }
+
+    /// Write a zero-filled TSS and place its descriptor into the kernel GDT.
+    fn setup_multiboot_tss(&mut self, zone_id: usize) {
+        // Zero the TSS area.
+        if let Ok((tss_hpa, _, _)) = unsafe { self.gpm.page_table_query(MB2_TSS_GPA) } {
+            let tss_ptr = tss_hpa as *mut u8;
+            unsafe {
+                for i in 0..MB2_TSS_SIZE {
+                    core::ptr::write_volatile(tss_ptr.add(i), 0);
+                }
+            }
+            info!("[ZONE{}] TSS written to GPA {:#x}", zone_id, MB2_TSS_GPA);
+        } else {
+            warn!("[ZONE{}] Failed to write TSS: GPA {:#x} not mapped", zone_id, MB2_TSS_GPA);
+            return;
+        }
+
+        // Install TSS descriptor into the kernel GDT.
+        let entry_gpa = MB2_GDT_BASE_GPA + MB2_GDT_TSS_ENTRY * 8;
+        let desc = Self::make_tss_descriptor(MB2_TSS_GPA, MB2_TSS_SIZE as u64 - 1);
+        if let Ok((gdt_hpa, _, _)) = unsafe { self.gpm.page_table_query(entry_gpa) } {
+            unsafe {
+                core::ptr::write_volatile(gdt_hpa as *mut u64, desc);
+            }
+            info!("[ZONE{}] TSS descriptor written at GPA {:#x}", zone_id, entry_gpa);
+        }
+    }
+
+    fn setup_multiboot_boot_regs(&self, config: &HvZoneConfig, zone_id: usize) {
+        self.cpu_set.iter().for_each(|cpuid| {
+            let cpu_data = get_cpu_data(cpuid);
+            if cpuid == self.cpu_set.first_cpu().unwrap() {
+                cpu_data.arch_cpu.set_multiboot_mode(true);
+                cpu_data.arch_cpu.set_multiboot_boot_regs(
+                    config.arch_config.multiboot_info_paddr as _,
+                );
+                info!("[ZONE{}] Multiboot2: EAX=0x36D76289, EBX=0x{:x}",
+                    zone_id, config.arch_config.multiboot_info_paddr);
+            }
+        });
     }
 
     pub fn arch_zone_post_configuration(&mut self, config: &HvZoneConfig) -> HvResult {
@@ -146,8 +234,11 @@ impl Zone {
         }*/
 
         boot::BootParams::fill(&config, &mut self.gpm);
-        acpi::copy_to_guest_memory_region(&config, &self.cpu_set);
 
+        // Copy ACPI tables for all zones (including Multiboot2 mode).
+        // Zone1 uses dedicated RSDP region (ID 1) and ACPI region (ID 3)
+        // at non-conflicting GPAs (0xe0000 and 0x1ff00000 respectively).
+        acpi::copy_to_guest_memory_region(&config, &self.cpu_set);
         Ok(())
     }
 }
